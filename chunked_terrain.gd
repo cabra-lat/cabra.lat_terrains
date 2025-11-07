@@ -1,5 +1,5 @@
 extends Node3D
-class_name DynamicTerrainLoader
+class_name DynamicTerrainLoader2
 
 @export_category("Player Tracking")
 @export var target_node: Node3D
