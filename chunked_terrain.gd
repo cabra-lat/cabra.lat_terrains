@@ -1,911 +1,674 @@
-@tool
-class_name ChunkedTerrain
 extends Node3D
+class_name DynamicTerrainLoader
 
-@export_category("Terrain Settings")
-@export var tiles_number: Vector2i = Vector2i(8,8)
-@export var tile_size_km: Vector2 = Vector2(439.296, 439.296)
-@export var chunks_per_tile: Vector2i = Vector2i(8, 8)
-@export var subdivisions_per_chunk: int = 64
-@export var max_height_meters: float = 2995.0
-@onready var material: ShaderMaterial = ShaderMaterial.new()
+@export_category("Player Tracking")
+@export var target_node: Node3D
+@export var update_interval: float = 1.0
 
-# HEIGHTMAP CONFIGURATION
-@export_category("Heightmap Configuration")
-## Use [color=#ff0000]{0}[/color] for i [color=#ff0000](row)[/color]
-## and [color=#00ff00]{1}[/color] for j ([color=#00ff00](column)[/color] [br]
-## Examples: [br]
-## - [color=#ffff00]res://heightmaps/tile_[color=#ff0000]{0}[/color]x[color=#00ff00]{1}[/color].png [/color][br]
-## - [color=#ffff00]res://maps/region_[color=#ff0000]{0}[/color]_[color=#00ff00]{1}[/color].jpg[/color]
-@export var heightmap_path_pattern: String = "res://assets/heightmaps/brazil_relief_tile_i{0}_j{1}.png":
-    set(value):
-        heightmap_path_pattern = value
-        if Engine.is_editor_hint():
-            # Re-preload textures when pattern changes
-            call_deferred("preload_tile_textures")
-            if enable_editor_preview:
-                call_deferred("_update_editor_preview")
+@export_category("World Settings")
+@export var start_latitude: float = -15.708  # Brasília coordinates
+@export var start_longitude: float = -48.560
+@export var world_scale: float = 100.0  # Meters per degree at equator
+@export var max_view_distance: float = 2000.0  # Meters
 
-# SPAWN POINT CONFIGURATION
-@export_category("Spawn Point Settings")
-@export var spawn_tile_index: Vector2i = Vector2i(2, 2):
-    set(value):
-        spawn_tile_index = value
-        if Engine.is_editor_hint() and enable_editor_preview:
-            call_deferred("_update_editor_preview")
-@export var spawn_chunk_index: Vector2i = Vector2i(-1, -1):  # -1 means center of tile
-    set(value):
-        spawn_chunk_index = value
-        if Engine.is_editor_hint() and enable_editor_preview:
-            call_deferred("_update_editor_preview")
-@export var show_spawn_marker: bool = true:
-    set(value):
-        show_spawn_marker = value
-        if Engine.is_editor_hint() and enable_editor_preview:
-            call_deferred("_update_editor_preview")
+@export_category("LOD Settings")
+@export var min_zoom: int = 15  # Highest detail (ground level)
+@export var max_zoom: int = 10  # Lowest detail (high altitude)
+@export var lod_height_threshold: float = 1000.0  # Height where we switch to lower LOD
 
-@export_category("Performance Settings")
-@export var render_distance: float = 2000.0
-@export var collision_distance: float = 1000.0
-@export var update_interval: float = 0.1
+@export_category("Performance")
+@export var max_concurrent_downloads: int = 2
+@export var cache_size: int = 25
 
-@export_category("Player References")
-@export var player_node_path: NodePath
-@export var camera_node_path: NodePath
 
-# EDITOR PREVIEW SETTINGS
-@export_category("Editor Preview")
-@export var enable_editor_preview: bool = false:
-    set(value):
-        enable_editor_preview = value
-        if Engine.is_editor_hint():
-            call_deferred("_update_editor_preview")
-@export var preview_radius_chunks: int = 2:
-    set(value):
-        preview_radius_chunks = value
-        if Engine.is_editor_hint() and enable_editor_preview:
-            call_deferred("_update_editor_preview")
-@export var preview_show_collision: bool = false:
-    set(value):
-        preview_show_collision = value
-        if Engine.is_editor_hint() and enable_editor_preview:
-            call_deferred("_update_editor_preview")
-@export var preview_show_wireframe: bool = true:
-    set(value):
-        preview_show_wireframe = value
-        if Engine.is_editor_hint() and enable_editor_preview:
-            call_deferred("_update_editor_preview")
+@export_category("Collision Settings")
+@export var enable_collision: bool = true
+@export var collision_resolution: int = 256  # Match the texture resolution
+@export var collision_lod_threshold: float = 500.0  # Only generate collision when below this altitude@export_category("Collision Settings")
+@export_category("Advanced Collision Settings")
+@export var max_concurrent_collision_generations: int = 1
+@export var collision_generation_timeout: float = 0.5  # Seconds to wait before generating collision
+@export var use_collision_threading: bool = false
 
-# Editor preview state
-var editor_preview_initialized: bool = false
-var pending_preview_update: bool = false
+var collision_generation_queue: Array = []
+var active_collision_generations: int = 0
+var collision_mutex: Mutex = Mutex.new()
+var collision_thread: Thread
 
-# OPTIONAL: Auto-update preview based on editor camera position
-var last_editor_camera_position: Vector3 = Vector3.ZERO
-@export var preview_auto_follow_camera: bool = false:
-    set(value):
-        preview_auto_follow_camera = value
-        if Engine.is_editor_hint() and enable_editor_preview:
-            call_deferred("_update_editor_preview")
+# Collision tracking
+var current_collision_body: StaticBody3D = null
+var collision_shapes: Dictionary = {}
+var last_collision_update: int = 0
 
-func _process(delta):
-    if Engine.is_editor_hint() and enable_editor_preview and preview_auto_follow_camera:
-        var editor_camera = _get_editor_camera()
-        if editor_camera:
-            var cam_pos = editor_camera.global_position
-            # Only update if camera moved significantly
-            if cam_pos.distance_to(last_editor_camera_position) > 100.0:
-                last_editor_camera_position = cam_pos
-                # Convert camera position to tile/chunk coordinates
-                var tile_chunk_pos = _world_to_tile_chunk(cam_pos)
-                call_deferred("_load_preview_chunks_around", tile_chunk_pos[0], tile_chunk_pos[1])
+# Internal state
+var current_tile_coords: Vector2i
+var current_zoom: int = min_zoom
+var loaded_tiles: Dictionary = {}
+var download_queue: Array = []
+var active_downloads: int = 0
+var tile_cache: Array = []
 
-func _get_editor_camera() -> Camera3D:
-    # Try to get the editor camera
-    var viewport = get_viewport()
-    if viewport:
-        return viewport.get_camera_3d()
-    return null
+# Threading
+var download_thread: Thread
+var mutex: Mutex
+var semaphore: Semaphore
+var should_exit: bool = false
 
-func _world_to_tile_chunk(world_pos: Vector3) -> Array:
-    var local_pos = to_local(world_pos)
-    var tile_size_m = tile_size_km * 1000.0
+# HTTP requests (must be created on main thread)
+var http_requests: Array = []
 
-    var tile_i = int(local_pos.z / tile_size_m.y)
-    var tile_j = int(local_pos.x / tile_size_m.x)
+# Mesh
+var terrain_mesh_instance: MeshInstance3D
+var shader_material: ShaderMaterial
 
-    var chunk_i = int((local_pos.z - tile_i * tile_size_m.y) / chunk_size_m.y)
-    var chunk_j = int((local_pos.x - tile_j * tile_size_m.x) / chunk_size_m.x)
+const TILE_BASE_URL = "https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.png"
 
-    return [Vector2i(tile_i, tile_j), Vector2i(chunk_j, chunk_i)]
+func queue_collision_generation(tile_coords: Vector2i, zoom: int, texture: Texture2D):
+    collision_mutex.lock()
+    collision_generation_queue.append({
+        "coords": tile_coords,
+        "zoom": zoom,
+        "texture": texture
+    })
+    collision_mutex.unlock()
 
-# Tile and chunk management
-var tiles = {}
-var tile_textures = {}
-var camera: Camera3D
-var player_node: Node3D
-var chunk_load_timer: Timer
+func generate_collision_threaded(collision_job):
+    var tile_coords = collision_job["coords"]
+    var zoom = collision_job["zoom"]
+    var texture = collision_job["texture"]
 
-# Debug
-var debug_label: Label3D
+    var collision_shape = generate_collision_shape(texture)
 
-# Editor preview chunks
-var editor_preview_chunks = []
-var spawn_marker: MeshInstance3D
+    if collision_shape:
+        call_deferred("_on_collision_generation_complete", tile_coords, zoom, collision_shape)
+    else:
+        collision_mutex.lock()
+        active_collision_generations -= 1
+        collision_mutex.unlock()
 
-# World origin management
-var world_origin: Vector3 = Vector3.ZERO
-var player_last_position: Vector3 = Vector3.ZERO
-var origin_update_threshold: float = 500.0
+func _on_collision_generation_complete(tile_coords: Vector2i, zoom: int, collision_shape: HeightMapShape3D):
+    var tile_key = get_tile_key(tile_coords, zoom)
 
-# Spawn point management
-var spawn_point_world_position: Vector3 = Vector3.ZERO
+    # Cache the shape
+    collision_shapes[tile_key] = collision_shape
 
-# Calculate chunk size in meters
-var chunk_size_m: Vector2:
-    get:
-        return tile_size_km * 1000.0 / Vector2(chunks_per_tile)
+    # Set as current collision if this is still the active tile
+    if tile_coords == current_tile_coords and zoom == current_zoom:
+        if current_collision_body:
+            current_collision_body.queue_free()
 
-# Add to ChunkedTerrain class
-var collision_processing_timer: Timer
+        current_collision_body = create_collision_body_from_shape(collision_shape)
+        add_child(current_collision_body)
+        print("High-res collision generated for tile: ", tile_coords)
+
+    collision_mutex.lock()
+    active_collision_generations -= 1
+    collision_mutex.unlock()
+
+    if collision_thread and collision_thread.is_started():
+        collision_thread.wait_to_finish()
+        collision_thread = null
+
+func update_shader_with_tile(tile_coords: Vector2i, zoom: int):
+    var tile_key = get_tile_key(tile_coords, zoom)
+
+    if loaded_tiles.has(tile_key):
+        var tile_data = loaded_tiles[tile_key]
+        var texture = tile_data["texture"]
+
+        # Update shader parameters
+        shader_material.set_shader_parameter("heightmap_texture", texture)
+        shader_material.set_shader_parameter("tile_coords", Vector2(tile_coords))
+        shader_material.set_shader_parameter("current_zoom", zoom)
+        shader_material.set_shader_parameter("terrain_scale", 100.0)
+        shader_material.set_shader_parameter("height_scale", 0.1)
+
+        # Update mesh for current zoom
+        update_mesh_for_zoom(zoom)
+
+        # Generate collision if enabled and we're close to the ground
+        if enable_collision and target_node and target_node.global_position.y < collision_lod_threshold:
+            call_deferred("generate_collision_for_tile", tile_coords, zoom, texture)
+
+        print("Updated terrain to tile: ", tile_coords, " at zoom ", zoom)
+
+
+func generate_collision_for_tile(tile_coords: Vector2i, zoom: int, texture: Texture2D):
+    var tile_key = get_tile_key(tile_coords, zoom)
+
+    # Remove old collision body if it exists
+    if current_collision_body:
+        current_collision_body.queue_free()
+        current_collision_body = null
+
+    # Check if we already have a collision shape for this tile
+    if collision_shapes.has(tile_key):
+        current_collision_body = create_collision_body_from_shape(collision_shapes[tile_key])
+        add_child(current_collision_body)
+        print("Reused existing collision for tile: ", tile_coords)
+        return
+
+    # Generate new collision shape with full resolution
+    var collision_shape = generate_collision_shape(texture)
+    if collision_shape:
+        # Cache the shape for future use
+        collision_shapes[tile_key] = collision_shape
+        current_collision_body = create_collision_body_from_shape(collision_shape)
+        add_child(current_collision_body)
+        print("Generated high-res collision (256x256) for tile: ", tile_coords)
+
+
+func generate_collision_shape(texture: Texture2D) -> HeightMapShape3D:
+    var image = texture.get_image()
+    var image_size = image.get_size()
+
+    # Use full texture resolution for collision
+    var collision_width = image_size.x  # 256
+    var collision_depth = image_size.y  # 256
+    var height_data = PackedFloat32Array()
+    height_data.resize(collision_width * collision_depth)
+
+    # Sample every pixel of the heightmap
+    for z in range(collision_depth):
+        for x in range(collision_width):
+            var color = image.get_pixel(x, z)
+            var height = decode_height_from_color(color) * 0.1  # Match the visual scale
+
+            height_data[z * collision_width + x] = height
+
+    # Create heightmap shape
+    var heightmap_shape = HeightMapShape3D.new()
+    heightmap_shape.map_width = collision_width
+    heightmap_shape.map_depth = collision_depth
+    heightmap_shape.map_data = height_data
+
+    return heightmap_shape
+
+
+
+func create_collision_body_from_shape(shape: HeightMapShape3D) -> StaticBody3D:
+    var static_body = StaticBody3D.new()
+    var collision_shape = CollisionShape3D.new()
+    collision_shape.shape = shape
+
+    # SCALE THE COLLISION SHAPE TO MATCH THE VISUAL MESH
+    # Our visual mesh is 100m x 100m, but the heightmap shape defaults to 1 unit per vertex
+    # We need to scale it to match our 100m x 100m visual size
+    var mesh_size = 100.0  # Match the visual mesh size
+    var scale_x = mesh_size / (shape.map_width - 1)
+    var scale_z = mesh_size / (shape.map_depth - 1)
+    collision_shape.scale = Vector3(scale_x, 1.0, scale_z)
+
+    static_body.add_child(collision_shape)
+
+    return static_body
+
+
+func decode_height_from_color(color: Color) -> float:
+    var r = color.r * 255.0
+    var g = color.g * 255.0
+    var b = color.b * 255.0
+    return (r * 256.0 + g + b / 256.0) - 32768.0
+
+# Add this to clean up collision shapes when they're no longer needed
+func cleanup_old_collision_shapes():
+    var current_tile_key = get_tile_key(current_tile_coords, current_zoom)
+    var keys_to_remove = []
+
+    for key in collision_shapes:
+        if key != current_tile_key and not loaded_tiles.has(key):
+            keys_to_remove.append(key)
+
+    for key in keys_to_remove:
+        collision_shapes.erase(key)
+
+    if keys_to_remove.size() > 0:
+        print("Cleaned up ", keys_to_remove.size(), " old collision shapes")
 
 func _ready():
-    if Engine.is_editor_hint():
-        # Editor-specific setup
-        preload_tile_textures()
-        _create_spawn_marker()
-        editor_preview_initialized = true
+    mutex = Mutex.new()
+    semaphore = Semaphore.new()
 
-        # Create collision processing timer for editor
-        collision_processing_timer = Timer.new()
-        collision_processing_timer.wait_time = 0.1
-        collision_processing_timer.one_shot = true
-        collision_processing_timer.timeout.connect(_process_pending_collisions)
-        add_child(collision_processing_timer)
+    # Create HTTP requests on main thread
+    for i in range(max_concurrent_downloads):
+        var http_request = HTTPRequest.new()
+        add_child(http_request)
+        http_requests.append(http_request)
 
-        if enable_editor_preview:
-            call_deferred("_update_editor_preview")
+    setup_terrain_mesh()
+
+    # Start download thread
+    download_thread = Thread.new()
+    download_thread.start(_download_worker)
+
+    # Initial load
+    call_deferred("update_terrain")
+
+func _exit_tree():
+    should_exit = true
+    semaphore.post()  # Wake up thread so it can exit
+    if download_thread and download_thread.is_started():
+        download_thread.wait_to_finish()
+
+    for http_request in http_requests:
+        http_request.queue_free()
+
+func setup_terrain_mesh():
+    terrain_mesh_instance = MeshInstance3D.new()
+    add_child(terrain_mesh_instance)
+
+    # Create a simple plane for now - we'll update it based on loaded tiles
+    var plane_mesh = PlaneMesh.new()
+    plane_mesh.size = Vector2(10, 10)
+    terrain_mesh_instance.mesh = plane_mesh
+
+    # Create shader material
+    shader_material = ShaderMaterial.new()
+    shader_material.shader = preload("shaders/terrain_shader.gdshader")
+    terrain_mesh_instance.material_override = shader_material
+
+func _physics_process(delta):
+    time_since_last_update += delta
+    if time_since_last_update >= update_interval:
+        time_since_last_update = 0.0
+        update_terrain()
+    # Process collision generation queue
+    collision_mutex.lock()
+    if collision_generation_queue.size() > 0 and active_collision_generations < max_concurrent_collision_generations:
+        var collision_job = collision_generation_queue.pop_front()
+        active_collision_generations += 1
+        collision_mutex.unlock()
+
+        # Generate collision in a thread if enabled, otherwise on main thread
+        if use_collision_threading and collision_thread == null:
+            collision_thread = Thread.new()
+            collision_thread.start(generate_collision_threaded.bind(collision_job))
+        else:
+            call_deferred("generate_collision_for_tile", collision_job["coords"], collision_job["zoom"], collision_job["texture"])
+            active_collision_generations -= 1
     else:
-        # Game runtime setup
-        preload_tile_textures()
-        setup_terrain()
-        setup_world_origin()
-        setup_spawn_point()
-        load_initial_chunks_around_spawn()
-        start_chunk_management()
-        setup_debug()
+        collision_mutex.unlock()
 
-# NEW: Process pending collisions after a delay
-func _process_pending_collisions():
-    if not Engine.is_editor_hint() or not is_inside_tree():
+var time_since_last_update: float = 0.0
+
+func update_terrain():
+    if not target_node:
         return
 
-    for chunk in editor_preview_chunks:
-        if is_instance_valid(chunk) and chunk.pending_collision:
-            chunk._add_collision_internal(chunk.pending_collision_height)
+    var player_pos = target_node.global_position
 
-# UPDATED: Update editor preview with collision processing
-func _update_editor_preview():
-    if not Engine.is_editor_hint():
+    # Calculate dynamic zoom based on altitude
+    var new_zoom = calculate_dynamic_zoom(player_pos.y)
+    if new_zoom != current_zoom:
+        current_zoom = new_zoom
+        print("Zoom level changed to: ", current_zoom)
+
+    # Convert player position to tile coordinates
+    var new_tile_coords = world_to_tile_coords(player_pos)
+
+    if new_tile_coords != current_tile_coords or new_zoom != current_zoom:
+        current_tile_coords = new_tile_coords
+        load_tile_and_neighbors(new_tile_coords)
+
+func calculate_dynamic_zoom(altitude: float) -> int:
+    # Higher altitude = lower zoom (less detail)
+    var t = clamp(altitude / lod_height_threshold, 0.0, 1.0)
+    return int(lerp(float(min_zoom), float(max_zoom), t))
+
+func world_to_tile_coords(world_position: Vector3) -> Vector2i:
+    # Convert world position to geographic coordinates
+    var lat_lon = world_to_lat_lon(world_position)
+    return lat_lon_to_tile(lat_lon.x, lat_lon.y, current_zoom)
+
+func world_to_lat_lon(world_pos: Vector3) -> Vector2:
+    # Convert world coordinates (meters) to lat/lon
+    # Use a simpler approach - treat the world as a local area around start position
+    var meters_per_degree = 111000.0  # Approximate meters per degree
+
+    var lat = start_latitude - (world_pos.z / meters_per_degree)
+    var lon = start_longitude + (world_pos.x / meters_per_degree)
+
+    return Vector2(lat, lon)
+
+func lat_lon_to_tile(lat: float, lon: float, zoom: int) -> Vector2i:
+    var n = pow(2.0, zoom)
+    var x_tile = int((lon + 180.0) / 360.0 * n)
+    var lat_rad = deg_to_rad(lat)
+    var y_tile = int((1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / PI) / 2.0 * n)
+    return Vector2i(x_tile, y_tile)
+
+func deg_to_rad(deg: float) -> float:
+    return deg * PI / 180.0
+
+func load_tile_and_neighbors(center_tile: Vector2i):
+    # Calculate how many neighbors to load based on view distance and zoom
+    var num_neighbors = calculate_neighbor_count()
+
+    for x in range(-num_neighbors, num_neighbors + 1):
+        for y in range(-num_neighbors, num_neighbors + 1):
+            var tile_coords = Vector2i(center_tile.x + x, center_tile.y + y)
+            queue_tile_download(tile_coords)
+
+func calculate_neighbor_count() -> int:
+    # Calculate how many neighboring tiles to load based on view distance
+    # Higher zoom = smaller tiles = more neighbors needed
+    var base_tile_size_meters = 40000000.0 / pow(2.0, current_zoom)  # Approximate tile size in meters
+    var tiles_needed = int(ceil(max_view_distance / base_tile_size_meters))
+    return clamp(tiles_needed, 1, 3)  # Limit to reasonable number
+
+func queue_tile_download(tile_coords: Vector2i):
+    mutex.lock()
+
+    var tile_key = get_tile_key(tile_coords, current_zoom)
+
+    if loaded_tiles.has(tile_key) or is_tile_in_queue(tile_coords, current_zoom):
+        mutex.unlock()
         return
 
-    if not is_inside_tree():
-        pending_preview_update = true
-        return
-
-    if not editor_preview_initialized:
-        return
-
-    _clear_editor_preview()
-
-    if not enable_editor_preview:
-        return
-
-    # Update spawn marker
-    call_deferred("_create_spawn_marker")
-
-    # Load preview chunks around spawn point
-    call_deferred("_load_preview_chunks_around_spawn")
-
-    # Process collisions after a short delay
-    if collision_processing_timer:
-        collision_processing_timer.start()
-
-# NEW: Load preview chunks specifically around spawn
-func _load_preview_chunks_around_spawn():
-    if not Engine.is_editor_hint() or not is_inside_tree():
-        return
-
-    var center_tile = spawn_tile_index
-    var center_chunk = spawn_chunk_index
-
-    # If spawn chunk is -1 (tile center), use center of tile
-    if center_chunk.x == -1 or center_chunk.y == -1:
-        center_chunk = Vector2i(chunks_per_tile.x / 2, chunks_per_tile.y / 2)
-
-    print("Loading editor preview around spawn - Tile: ", center_tile, " Chunk: ", center_chunk)
-
-    # Load the center tile first
-    var center_tile_texture = tile_textures.get(Vector2(center_tile.x, center_tile.y))
-    if center_tile_texture:
-        # Load chunks in center tile
-        for chunk_i in range(max(0, center_chunk.x - preview_radius_chunks), min(chunks_per_tile.x, center_chunk.x + preview_radius_chunks + 1)):
-            for chunk_j in range(max(0, center_chunk.y - preview_radius_chunks), min(chunks_per_tile.y, center_chunk.y + preview_radius_chunks + 1)):
-                _create_editor_chunk_safe(center_tile, Vector2(chunk_j, chunk_i), center_tile_texture)
-
-    # Load adjacent tiles if they exist
-    for i in range(-1, 2):
-        for j in range(-1, 2):
-            if i == 0 and j == 0:
-                continue  # Skip center tile (already loaded)
-
-            var adj_tile = Vector2i(center_tile.x + i, center_tile.y + j)
-            if adj_tile.x >= 0 and adj_tile.x < tiles_number.x and adj_tile.y >= 0 and adj_tile.y < tiles_number.y:
-                var adj_texture = tile_textures.get(Vector2(adj_tile.x, adj_tile.y))
-                if adj_texture:
-                    # For adjacent tiles, load chunks near the edge closest to center
-                    var start_i = 0
-                    var end_i = chunks_per_tile.x
-                    var start_j = 0
-                    var end_j = chunks_per_tile.y
-
-                    if i == -1:  # Left tile - load right edge
-                        start_i = chunks_per_tile.x - preview_radius_chunks
-                    elif i == 1:  # Right tile - load left edge
-                        end_i = preview_radius_chunks
-
-                    if j == -1:  # Top tile - load bottom edge
-                        start_j = chunks_per_tile.y - preview_radius_chunks
-                    elif j == 1:  # Bottom tile - load top edge
-                        end_j = preview_radius_chunks
-
-                    for chunk_i in range(start_i, end_i):
-                        for chunk_j in range(start_j, end_j):
-                            _create_editor_chunk_safe(adj_tile, Vector2(chunk_j, chunk_i), adj_texture)
-
-# UPDATED: Safe editor chunk creation
-func _create_editor_chunk_safe(tile_pos: Vector2, chunk_pos: Vector2, texture: Texture2D):
-    if not Engine.is_editor_hint() or not is_inside_tree():
-        return
-
-    var tile_size_m = tile_size_km * 1000.0
-
-    # Calculate LOCAL position for this chunk
-    var local_position = Vector3(
-        tile_pos.y * tile_size_m.x + chunk_pos.x * chunk_size_m.x,
-        0,
-        tile_pos.x * tile_size_m.y + chunk_pos.y * chunk_size_m.y
-    )
-
-    var chunk = TerrainChunk.new()
-
-    # Use the local setup method
-    chunk.setup_tile_local(
-        Vector3(chunk_size_m.x, 0, chunk_size_m.y),
-        local_position,
-        texture,
-        material,
-        max_height_meters,
-        render_distance,
-        subdivisions_per_chunk,
-        tile_pos,
-        chunk_pos,
-        Vector2(chunks_per_tile)
-    )
-
-    # Apply editor preview settings
-    if preview_show_wireframe:
-        chunk.set_wireframe_mode(true)
-
-    add_child(chunk)
-
-    # Set owner for proper editing
-    if Engine.is_editor_hint() and is_inside_tree():
-        var scene_root = get_tree().get_edited_scene_root()
-        if scene_root:
-            chunk.set_owner(scene_root)
-
-    editor_preview_chunks.append(chunk)
-
-    # Add collision safely - it will handle tree state internally
-    if preview_show_collision:
-        chunk.add_collision(max_height_meters)
-
-# UPDATED: Clear preview with safety checks
-func _clear_editor_preview():
-    for chunk in editor_preview_chunks:
-        if is_instance_valid(chunk):
-            if chunk.is_inside_tree():
-                remove_child(chunk)
-            chunk.queue_free()
-    editor_preview_chunks.clear()
-
-    # Clean up spawn marker if preview is disabled
-    if not enable_editor_preview and spawn_marker and is_instance_valid(spawn_marker):
-        if spawn_marker.is_inside_tree():
-            remove_child(spawn_marker)
-        spawn_marker.queue_free()
-        spawn_marker = null
-
-# NEW: Handle when node enters tree
-func _enter_tree():
-    if Engine.is_editor_hint():
-        if pending_preview_update:
-            call_deferred("_update_editor_preview")
-            pending_preview_update = false
-
-func _create_spawn_marker():
-    # Remove existing spawn marker safely
-    if spawn_marker and is_instance_valid(spawn_marker):
-        if spawn_marker.is_inside_tree():
-            remove_child(spawn_marker)
-        spawn_marker.queue_free()
-        spawn_marker = null
-
-    if not show_spawn_marker or not is_inside_tree():
-        return
-
-    # Calculate spawn position in LOCAL coordinates
-    var spawn_pos_local = calculate_spawn_position_local()
-    print("Creating spawn marker at local position: ", spawn_pos_local)
-
-    # Create marker with proper deferred setup
-    var marker = MeshInstance3D.new()
-    var sphere_mesh = SphereMesh.new()
-    sphere_mesh.radius = 10.0
-    sphere_mesh.height = 20.0
-
-    var marker_material = StandardMaterial3D.new()
-    marker_material.albedo_color = Color(1, 0, 0, 0.8)
-    marker_material.emission_enabled = true
-    marker_material.emission = Color(1, 0, 0, 0.3)
-    sphere_mesh.material = marker_material
-
-    marker.mesh = sphere_mesh
-    marker.position = spawn_pos_local + Vector3(0, 15, 0)
-
-    # Add label
-    var label = Label3D.new()
-    label.text = "Spawn Point\nTile: %d,%d\nChunk: %s" % [
-        spawn_tile_index.x, spawn_tile_index.y,
-        "%d,%d" % [spawn_chunk_index.x, spawn_chunk_index.y] if spawn_chunk_index.x != -1 else "Tile Center"
-    ]
-    label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-    label.position = Vector3(0, 25, 0)
-    label.modulate = Color(1, 1, 1, 1)
-    marker.add_child(label)
-
-    add_child(marker)
-    spawn_marker = marker
-
-    # Set owner for editor - only if we have a valid scene root
-    if Engine.is_editor_hint() and is_inside_tree():
-        var scene_root = get_tree().get_edited_scene_root()
-        if scene_root:
-            marker.set_owner(scene_root)
-            label.set_owner(scene_root)
-
-# NEW: Calculate spawn position in LOCAL coordinates
-func calculate_spawn_position_local() -> Vector3:
-    var tile_size_m = tile_size_km * 1000.0
-
-    if spawn_chunk_index.x == -1 or spawn_chunk_index.y == -1:
-        # Spawn at tile center - LOCAL position
-        return Vector3(
-            (spawn_tile_index.y + 0.5) * tile_size_m.x,
-            0,
-            (spawn_tile_index.x + 0.5) * tile_size_m.y
-        )
-    else:
-        # Spawn at specific chunk center - LOCAL position
-        return Vector3(
-            spawn_tile_index.y * tile_size_m.x + (spawn_chunk_index.x + 0.5) * chunk_size_m.x,
-            0,
-            spawn_tile_index.x * tile_size_m.y + (spawn_chunk_index.y + 0.5) * chunk_size_m.y
-        )
-
-# UPDATED: Calculate world spawn position (for reference)
-func calculate_spawn_position() -> Vector3:
-    var local_pos = calculate_spawn_position_local()
-    return global_position + local_pos
-
-# UPDATED: Setup spawn point system
-func setup_spawn_point():
-    spawn_point_world_position = calculate_spawn_position()
-    print("Spawn point set at world position: ", spawn_point_world_position)
-    print("Spawn point local position: ", calculate_spawn_position_local())
-    print("Spawn tile: ", spawn_tile_index, " Chunk: ", spawn_chunk_index)
-
-    # Create spawn marker in game mode too
-    if not Engine.is_editor_hint() and show_spawn_marker:
-        _create_spawn_marker()
-
-# UPDATED: Setup world origin to center on spawn point
-func setup_world_origin():
-    # Set world origin to spawn point (in world coordinates)
-    world_origin = spawn_point_world_position
-    print("World origin set to spawn point: ", world_origin)
-
-    if player_node:
-        player_last_position = player_node.global_position
-
-func _create_editor_chunk(tile_pos: Vector2, chunk_pos: Vector2, texture: Texture2D):
-    if not Engine.is_editor_hint() or not is_inside_tree():
-        return
-
-    var tile_size_m = tile_size_km * 1000.0
-
-    # Calculate LOCAL position for this chunk
-    var local_position = Vector3(
-        tile_pos.y * tile_size_m.x + chunk_pos.x * chunk_size_m.x,
-        0,
-        tile_pos.x * tile_size_m.y + chunk_pos.y * chunk_size_m.y
-    )
-
-    var chunk = TerrainChunk.new()
-    chunk.setup_tile(
-        Vector3(chunk_size_m.x, 0, chunk_size_m.y),
-        local_position,
-        texture,
-        material,
-        max_height_meters,
-        render_distance,
-        subdivisions_per_chunk,
-        tile_pos,
-        chunk_pos,
-        Vector2(chunks_per_tile)
-    )
-
-    # Apply editor preview settings
-    if preview_show_wireframe:
-        chunk.set_wireframe_mode(true)
-
-    add_child(chunk)
-
-    # Set owner for proper editing
-    if Engine.is_editor_hint() and is_inside_tree():
-        var scene_root = get_tree().get_edited_scene_root()
-        if scene_root:
-            chunk.set_owner(scene_root)
-
-    editor_preview_chunks.append(chunk)
-
-    # Add collision after adding to scene
-    if preview_show_collision:
-        chunk.call_deferred("add_collision", max_height_meters)
-
-# UPDATED: Chunk positioning uses local coordinates
-func calculate_chunk_world_position(tile_pos: Vector2, chunk_pos: Vector2) -> Vector3:
-    var tile_size_m = tile_size_km * 1000.0
-    var local_position = Vector3(
-        tile_pos.y * tile_size_m.x + chunk_pos.x * chunk_size_m.x + chunk_size_m.x / 2,
-        0,
-        tile_pos.x * tile_size_m.y + chunk_pos.y * chunk_size_m.y + chunk_size_m.y / 2
-    )
-    # Convert local to world position
-    return global_position + local_position
-
-# UPDATED: Chunk loading uses local coordinates
-func load_chunk(tile_pos: Vector2, chunk_pos: Vector2, with_collision: bool):
-    if not tiles.has(tile_pos):
-        tiles[tile_pos] = {}
-
-    if tiles[tile_pos].has(chunk_pos):
-        var chunk = tiles[tile_pos][chunk_pos]
-        if with_collision and chunk.chunk_state != "WITH_COLLISION":
-            add_collision_to_chunk(chunk)
-        elif not with_collision and chunk.chunk_state == "WITH_COLLISION":
-            remove_collision_from_chunk(chunk)
-        return
-
-    var tile_texture = tile_textures.get(tile_pos)
-    if not tile_texture:
-        print("No texture found for tile: ", tile_pos)
-        return
-
-    var tile_size_m = tile_size_km * 1000.0
-    # Use LOCAL position
-    var local_position = Vector3(
-        tile_pos.y * tile_size_m.x + chunk_pos.x * chunk_size_m.x,
-        0,
-        tile_pos.x * tile_size_m.y + chunk_pos.y * chunk_size_m.y
-    )
-
-    var chunk = TerrainChunk.new()
-    chunk.setup_tile(
-        Vector3(chunk_size_m.x, 0, chunk_size_m.y),
-        local_position,  # Local position
-        tile_texture,
-        material,
-        max_height_meters,
-        render_distance,
-        subdivisions_per_chunk,
-        tile_pos,
-        chunk_pos,
-        Vector2(chunks_per_tile)
-    )
-
-    add_child(chunk)
-    tiles[tile_pos][chunk_pos] = chunk
-
-    if with_collision:
-        add_collision_to_chunk(chunk)
-    else:
-        chunk.set_visual_only()
-
-    print("Loaded chunk %s at local position %s with collision: %s" % [chunk_pos, local_position, with_collision])
-
-# UPDATED: Debug info with better positioning info
-func update_debug_info(world_position: Vector3, tile_i: int, tile_j: int):
-    if debug_label:
-        var visual_count = 0
-        var collision_count = 0
-        var total_chunks = get_chunk_count()
-        var total_tiles = tiles.size()
-
-        for tile in tiles.values():
-            for chunk in tile.values():
-                if chunk.chunk_state == "WITH_COLLISION":
-                    collision_count += 1
-                else:
-                    visual_count += 1
-
-        var spawn_local = calculate_spawn_position_local()
-        debug_label.text = "Tiles: %d, Chunks: %d (V: %d, C: %d)\nWorld Pos: %s\nSpawn Local: %s\nSpawn: Tile %s, Chunk %s\nFPS: %d" % [
-            total_tiles, total_chunks, visual_count, collision_count,
-            "%.1f, %.1f, %.1f" % [world_position.x, world_position.y, world_position.z],
-            "%.1f, %.1f, %.1f" % [spawn_local.x, spawn_local.y, spawn_local.z],
-            "%d,%d" % [spawn_tile_index.x, spawn_tile_index.y],
-            "%d,%d" % [spawn_chunk_index.x, spawn_chunk_index.y] if spawn_chunk_index.x != -1 else "Center",
-            Engine.get_frames_per_second()
-        ]
-
-# NEW: Load initial chunks around spawn point
-func load_initial_chunks_around_spawn():
-    if Engine.is_editor_hint():
-        return
-
-    print("Loading initial chunks around spawn point...")
-
-    # Calculate which tiles and chunks should be loaded around spawn
-    var tile_size_m = tile_size_km * 1000.0
-    var tiles_x = ceil(render_distance / tile_size_m.x) + 1
-    var tiles_z = ceil(render_distance / tile_size_m.y) + 1
-
-    for tile_i in range(spawn_tile_index.x - tiles_z, spawn_tile_index.x + tiles_z + 1):
-        for tile_j in range(spawn_tile_index.y - tiles_x, spawn_tile_index.y + tiles_x + 1):
-            if tile_i >= 0 and tile_i < tiles_number.x and tile_j >= 0 and tile_j < tiles_number.y:
-                var tile_pos = Vector2(tile_i, tile_j)
-
-                # Load all chunks in this tile that are within render distance
-                for chunk_i in range(0, chunks_per_tile.x):
-                    for chunk_j in range(0, chunks_per_tile.y):
-                        var chunk_pos = Vector2(chunk_j, chunk_i)
-                        var chunk_world_pos = calculate_chunk_world_position(tile_pos, chunk_pos)
-                        var distance = spawn_point_world_position.distance_to(chunk_world_pos)
-
-                        if distance <= render_distance:
-                            var with_collision = distance <= collision_distance
-                            load_chunk(tile_pos, chunk_pos, with_collision)
-
-# UPDATED: World origin update now considers spawn point as reference
-func update_world_origin(new_center: Vector3):
-    var shift = new_center - world_origin
-
-    if shift.length() > origin_update_threshold:
-        print("Updating world origin. Shift: ", shift)
-        print("Old origin: ", world_origin, " New center: ", new_center)
-
-        # Shift all existing chunks
-        for tile_pos in tiles:
-            for chunk_pos in tiles[tile_pos]:
-                var chunk = tiles[tile_pos][chunk_pos]
-                chunk.global_position -= shift
-
-        # Update our world origin tracking
-        world_origin = new_center
-
-        # Update player's last position
-        if player_node:
-            player_last_position = player_node.global_position
-
-# UPDATED: Get terrain center now considers spawn point
-func get_terrain_center() -> Vector3:
-    return spawn_point_world_position
-
-# NEW: Load chunks around a specific point for preview
-func _load_preview_chunks_around(center_tile: Vector2i, center_chunk: Vector2i):
-    if not Engine.is_editor_hint():
-        return
-
-    var tile_texture = tile_textures.get(Vector2(center_tile.x, center_tile.y))
-    if not tile_texture:
-        push_warning("No texture found for center tile: " + str(center_tile))
-        return
-
-    # Preview chunks in the center tile
-    for chunk_i in range(max(0, center_chunk.x - preview_radius_chunks), min(chunks_per_tile.x, center_chunk.x + preview_radius_chunks + 1)):
-        for chunk_j in range(max(0, center_chunk.y - preview_radius_chunks), min(chunks_per_tile.y, center_chunk.y + preview_radius_chunks + 1)):
-            _create_editor_chunk(center_tile, Vector2(chunk_j, chunk_i), tile_texture)
-
-    # Also preview adjacent tiles if near edges
-    if center_chunk.x - preview_radius_chunks < 0:
-        # Need tiles to the left
-        var left_tile = Vector2i(center_tile.x, center_tile.y - 1)
-        if left_tile.y >= 0:
-            var left_texture = tile_textures.get(Vector2(left_tile.x, left_tile.y))
-            if left_texture:
-                for chunk_i in range(chunks_per_tile.x - preview_radius_chunks, chunks_per_tile.x):
-                    for chunk_j in range(max(0, center_chunk.y - preview_radius_chunks), min(chunks_per_tile.y, center_chunk.y + preview_radius_chunks + 1)):
-                        _create_editor_chunk(left_tile, Vector2(chunk_j, chunk_i), left_texture)
-
-    if center_chunk.x + preview_radius_chunks >= chunks_per_tile.x:
-        # Need tiles to the right
-        var right_tile = Vector2i(center_tile.x, center_tile.y + 1)
-        if right_tile.y < tiles_number.y:
-            var right_texture = tile_textures.get(Vector2(right_tile.x, right_tile.y))
-            if right_texture:
-                for chunk_i in range(0, preview_radius_chunks):
-                    for chunk_j in range(max(0, center_chunk.y - preview_radius_chunks), min(chunks_per_tile.y, center_chunk.y + preview_radius_chunks + 1)):
-                        _create_editor_chunk(right_tile, Vector2(chunk_j, chunk_i), right_texture)
-
-    if center_chunk.y - preview_radius_chunks < 0:
-        # Need tiles above
-        var top_tile = Vector2i(center_tile.x - 1, center_tile.y)
-        if top_tile.x >= 0:
-            var top_texture = tile_textures.get(Vector2(top_tile.x, top_tile.y))
-            if top_texture:
-                for chunk_i in range(max(0, center_chunk.x - preview_radius_chunks), min(chunks_per_tile.x, center_chunk.x + preview_radius_chunks + 1)):
-                    for chunk_j in range(chunks_per_tile.y - preview_radius_chunks, chunks_per_tile.y):
-                        _create_editor_chunk(top_tile, Vector2(chunk_j, chunk_i), top_texture)
-
-    if center_chunk.y + preview_radius_chunks >= chunks_per_tile.y:
-        # Need tiles below
-        var bottom_tile = Vector2i(center_tile.x + 1, center_tile.y)
-        if bottom_tile.x < tiles_number.x:
-            var bottom_texture = tile_textures.get(Vector2(bottom_tile.x, bottom_tile.y))
-            if bottom_texture:
-                for chunk_i in range(max(0, center_chunk.x - preview_radius_chunks), min(chunks_per_tile.x, center_chunk.x + preview_radius_chunks + 1)):
-                    for chunk_j in range(0, preview_radius_chunks):
-                        _create_editor_chunk(bottom_tile, Vector2(chunk_j, chunk_i), bottom_texture)
-
-# UPDATED: Property handling with tree checks
-func _set(property: StringName, value) -> bool:
-    if Engine.is_editor_hint():
-        if property.begins_with("preview_") or property.begins_with("spawn_") or property == "heightmap_path_pattern":
-            if is_inside_tree() and editor_preview_initialized:
-                call_deferred("_update_editor_preview")
-            else:
-                pending_preview_update = true
+    download_queue.append({"coords": tile_coords, "zoom": current_zoom})
+    mutex.unlock()
+    semaphore.post()  # Wake up download thread
+
+func is_tile_in_queue(coords: Vector2i, zoom: int) -> bool:
+    for tile in download_queue:
+        if tile["coords"] == coords and tile["zoom"] == zoom:
             return true
     return false
 
-# UPDATED: Exit tree cleanup
-func _exit_tree():
-    if Engine.is_editor_hint():
-        _clear_editor_preview()
+func get_tile_key(coords: Vector2i, zoom: int) -> String:
+    return "%d_%d_%d" % [coords.x, coords.y, zoom]
 
-func preload_tile_textures():
-    print("Preloading tile textures using pattern: ", heightmap_path_pattern)
+func _download_worker():
+    while not should_exit:
+        semaphore.wait()  # Wait for work
 
-    tile_textures.clear()
+        if should_exit:
+            break
 
-    var loaded_count = 0
-    var missing_count = 0
-    var failed_count = 0
+        mutex.lock()
+        if download_queue.size() == 0:
+            mutex.unlock()
+            continue
 
-    for i in range(tiles_number.x):
-        for j in range(tiles_number.y):
-            var texture_path = heightmap_path_pattern.format([i, j])
-            var tile_key = Vector2(i, j)
+        var tile_data = download_queue.pop_front()
+        var tile_coords = tile_data["coords"]
+        var zoom = tile_data["zoom"]
+        mutex.unlock()
 
-            if ResourceLoader.exists(texture_path):
-                # Method 1: Try loading as texture first
-                var resource = ResourceLoader.load(texture_path, "Texture2D", ResourceLoader.CACHE_MODE_IGNORE)
+        # First try to load from disk cache
+        var image_texture = load_tile_from_cache(tile_coords, zoom)
 
-                if resource and resource is Texture2D:
-                    var texture: Texture2D = resource
-                    var image = texture.get_image()
+        # If not in cache, download it
+        if not image_texture:
+            image_texture = download_tile_texture(tile_coords, zoom)
 
-                    if image:
-                        # Create a guaranteed-readable texture
-                        if image.is_compressed():
-                            if image.decompress() != OK:
-                                print("Failed to decompress image for tile ", tile_key)
-                                failed_count += 1
-                                continue
+        if image_texture:
+            mutex.lock()
+            var tile_key = get_tile_key(tile_coords, zoom)
+            loaded_tiles[tile_key] = {
+                "texture": image_texture,
+                "coords": tile_coords,
+                "zoom": zoom
+            }
 
-                        # Create new texture from decompressed image
-                        var image_texture = ImageTexture.create_from_image(image)
-                        if image_texture:
-                            tile_textures[tile_key] = image_texture
-                            loaded_count += 1
-                            print("Loaded tile: i=%d, j=%d -> %s (%dx%d)" % [
-                                i, j, texture_path, image.get_width(), image.get_height()
-                            ])
-                        else:
-                            failed_count += 1
-                            print("Failed to create ImageTexture for tile ", tile_key)
-                    else:
-                        # Use original texture if we can't get image data
-                        tile_textures[tile_key] = texture
-                        loaded_count += 1
-                        print("Loaded tile (no image access): i=%d, j=%d -> %s" % [i, j, texture_path])
-                else:
-                    # Method 2: Try loading as Image directly as fallback
-                    var image = Image.new()
-                    var error = image.load(texture_path)
-                    if error == OK:
-                        if image.is_compressed():
-                            image.decompress()
-                        var image_texture = ImageTexture.create_from_image(image)
-                        tile_textures[tile_key] = image_texture
-                        loaded_count += 1
-                        print("Loaded tile (fallback): i=%d, j=%d -> %s (%dx%d)" % [
-                            i, j, texture_path, image.get_width(), image.get_height()
-                        ])
-                    else:
-                        failed_count += 1
-                        print("Failed to load texture: ", texture_path, " Error: ", error)
-            else:
-                missing_count += 1
-                print("Missing tile: i=%d, j=%d -> %s" % [i, j, texture_path])
+            # Update cache (LRU)
+            update_tile_cache(tile_key, loaded_tiles[tile_key])
 
-    print("Preloaded %d tiles, %d missing, %d failed" % [loaded_count, missing_count, failed_count])
+            # If this is the current tile at current zoom, update the shader
+            if tile_coords == current_tile_coords and zoom == current_zoom:
+                call_deferred("update_shader_with_tile", tile_coords, zoom)
 
-    if Engine.is_editor_hint() and enable_editor_preview:
-        call_deferred("_update_editor_preview")
+            mutex.unlock()
 
-func setup_terrain():
-    if player_node_path:
-        player_node = get_node(player_node_path)
-    else:
-        player_node = get_tree().get_first_node_in_group("player")
+# New function to load tile from disk cache
+func load_tile_from_cache(tile_coords: Vector2i, zoom: int) -> Texture2D:
+    var cache_path = get_tile_cache_path(tile_coords, zoom)
+    var file = FileAccess.open(cache_path, FileAccess.READ)
 
-    if camera_node_path:
-        camera = get_node(camera_node_path)
-    else:
-        camera = get_viewport().get_camera_3d()
+    if file:
+        var buffer = file.get_buffer(file.get_length())
+        file.close()
 
-    chunk_load_timer = Timer.new()
-    chunk_load_timer.wait_time = update_interval
-    chunk_load_timer.timeout.connect(update_chunks)
-    add_child(chunk_load_timer)
+        var image = Image.new()
+        var error = image.load_png_from_buffer(buffer)
 
-func start_chunk_management():
-    update_chunks()
-    chunk_load_timer.start()
-    print("Chunk management started")
-    print("Spawn point: Tile ", spawn_tile_index, " Chunk ", spawn_chunk_index)
-    print("Total tiles available: ", tiles_number.x * tiles_number.y)
-    print("Chunks per tile: ", chunks_per_tile)
-    print("Render distance: ", render_distance, " meters")
+        if error == OK:
+            var texture = ImageTexture.create_from_image(image)
+            print("Loaded tile from cache: ", tile_coords, " at zoom ", zoom)
+            return texture
 
-func debug_chunk_states():
-    print("=== CHUNK STATES ===")
-    print("Total tiles loaded: ", tiles.size())
-    for tile_pos in tiles:
-        print("Tile ", tile_pos, " has ", tiles[tile_pos].size(), " chunks")
-        for chunk_pos in tiles[tile_pos]:
-            var chunk = tiles[tile_pos][chunk_pos]
-            print("  Chunk ", chunk_pos, " - State: ", chunk.chunk_state)
-    print("===================")
+    return null
 
-func add_collision_to_chunk(chunk: TerrainChunk):
-    if chunk.has_collision:
+# New function to save tile to disk cache
+func save_tile_to_cache(tile_coords: Vector2i, zoom: int, image_data: PackedByteArray) -> bool:
+    var cache_path = get_tile_cache_path(tile_coords, zoom)
+    var dir_path = cache_path.get_base_dir()
+
+    # Ensure directory exists
+    DirAccess.make_dir_recursive_absolute(dir_path)
+
+    var file = FileAccess.open(cache_path, FileAccess.WRITE)
+    if file:
+        file.store_buffer(image_data)
+        file.close()
+        print("Saved tile to cache: ", tile_coords, " at zoom ", zoom)
+        return true
+
+    return false
+
+# Get the file path for a cached tile
+func get_tile_cache_path(tile_coords: Vector2i, zoom: int) -> String:
+    return "user://tile_cache/zoom_%d/%d/%d.png" % [zoom, tile_coords.x, tile_coords.y]
+
+func update_tile_cache(tile_key: String, tile_data: Dictionary):
+    # Remove if already in cache
+    for i in range(tile_cache.size()):
+        if tile_cache[i].key == tile_key:
+            tile_cache.remove_at(i)
+            break
+
+    # Add to front
+    tile_cache.push_front({"key": tile_key, "data": tile_data})
+
+    # Trim cache if too large
+    while tile_cache.size() > cache_size:
+        var removed = tile_cache.pop_back()
+        loaded_tiles.erase(removed.key)
+
+func download_tile_texture(tile_coords: Vector2i, zoom: int) -> Texture2D:
+    var url = TILE_BASE_URL.format({
+        "z": zoom,
+        "x": tile_coords.x,
+        "y": tile_coords.y
+    })
+
+    var http_request = null
+    for request in http_requests:
+        if request.get_http_client_status() == HTTPClient.STATUS_DISCONNECTED:
+            http_request = request
+            break
+
+    if not http_request:
+        return null
+
+    var semaphore = Semaphore.new()
+    var result_array = []
+
+    # Connect to the signal in the main thread
+    call_deferred("_start_http_request", http_request, url, semaphore, result_array)
+
+    # Wait for the semaphore
+    semaphore.wait()
+
+    if result_array[0] != HTTPRequest.RESULT_SUCCESS:
+        print("Failed to download tile: ", tile_coords, " Error: ", result_array[0])
+        return null
+
+    var body = result_array[3] as PackedByteArray
+
+    # Save the raw PNG data to cache
+    save_tile_to_cache(tile_coords, zoom, body)
+
+    var image = Image.new()
+    var image_error = image.load_png_from_buffer(body)
+
+    if image_error != OK:
+        print("Failed to load PNG for tile: ", tile_coords)
+        return null
+
+    var texture = ImageTexture.create_from_image(image)
+    print("Successfully downloaded tile: ", tile_coords, " at zoom ", zoom)
+    return texture
+
+func _start_http_request(http_request: HTTPRequest, url: String, semaphore: Semaphore, result_array: Array):
+    # Disconnect if already connected to avoid multiple connections
+    if http_request.is_connected("request_completed", _on_http_request_completed):
+        http_request.request_completed.disconnect(_on_http_request_completed)
+    http_request.request_completed.connect(_on_http_request_completed.bind(semaphore, result_array))
+    var error = http_request.request(url)
+    if error != OK:
+        # If request fails immediately, we still need to post the semaphore
+        result_array.append_array([error, 0, [], []])
+        semaphore.post()
+
+func _on_http_request_completed(result_code: int, response_code: int, headers: PackedStringArray, body: PackedByteArray, semaphore: Semaphore, result_array: Array):
+    result_array.append_array([result_code, response_code, headers, body])
+    semaphore.post()
+
+func update_mesh_for_zoom(zoom: int):
+    # Use a fixed mesh size that's reasonable for viewing
+    var mesh_size = 100.0  # 100m x 100m area
+
+    var plane_mesh = PlaneMesh.new()
+    plane_mesh.size = Vector2(mesh_size, mesh_size)
+    plane_mesh.subdivide_depth = 255
+    plane_mesh.subdivide_width = 255
+
+    terrain_mesh_instance.mesh = plane_mesh
+
+func set_player_on_ground():
+    if not target_node:
         return
 
-    chunk.add_collision(max_height_meters)
+    # Use raycast to position player on terrain if collision is available
+    if current_collision_body:
+        var space_state = get_world_3d().direct_space_state
+        var query = PhysicsRayQueryParameters3D.create(
+            target_node.global_position + Vector3(0, 1000, 0),  # Start high above
+            target_node.global_position + Vector3(0, -1000, 0)   # End far below
+        )
+        query.collision_mask = 1  # Make sure we only hit terrain
 
-func remove_collision_from_chunk(chunk: TerrainChunk):
-    if not chunk.has_collision:
-        return
-
-    chunk.remove_collision()
-
-func remove_chunk(tile_pos: Vector2, chunk_pos: Vector2):
-    if tiles.has(tile_pos) and tiles[tile_pos].has(chunk_pos):
-        var chunk = tiles[tile_pos][chunk_pos]
-        remove_child(chunk)
-        chunk.queue_free()
-        tiles[tile_pos].erase(chunk_pos)
-        print("Removed chunk: ", chunk_pos, " from tile: ", tile_pos)
-
-func get_chunk_count() -> int:
-    var count = 0
-    for tile in tiles.values():
-        count += tile.size()
-    return count
-
-func setup_debug():
-    debug_label = Label3D.new()
-    debug_label.text = "Terrain System Ready"
-    debug_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-    debug_label.position = Vector3(0, 50, 0)
-    add_child(debug_label)
-
-func update_chunks():
-    if Engine.is_editor_hint():
-        return
-
-    debug_chunk_states()
-
-    var current_camera = get_viewport().get_camera_3d()
-    var reference_position
-
-    if current_camera:
-        reference_position = current_camera.global_position
-    elif player_node:
-        reference_position = player_node.global_position
+        var result = space_state.intersect_ray(query)
+        if result:
+            target_node.global_position = result.position + Vector3(0, 1.8, 0)  # 1.8m above ground (eye height)
+            print("Positioned player on high-res terrain collision: ", result.position)
+        else:
+            # Fallback to heightmap sampling
+            position_player_using_heightmap()
     else:
-        reference_position = Vector3.ZERO
+        # Fallback to heightmap sampling
+        position_player_using_heightmap()
 
-    update_world_origin(reference_position)
+func position_player_using_heightmap():
+    var player_pos = target_node.global_position
+    var lat_lon = world_to_lat_lon(player_pos)
+    var tile_coords = lat_lon_to_tile(lat_lon.x, lat_lon.y, current_zoom)
+    var tile_key = get_tile_key(tile_coords, current_zoom)
 
-    var tile_size_m = tile_size_km * 1000.0
-    var local_position = reference_position - world_origin
+    if loaded_tiles.has(tile_key):
+        var tile_data = loaded_tiles[tile_key]
+        var texture = tile_data["texture"]
+        var image = texture.get_image()
 
-    var current_tile_i = int(local_position.z / tile_size_m.y)
-    var current_tile_j = int(local_position.x / tile_size_m.x)
+        # Convert player position to UV coordinates within the tile
+        var tile_bounds = get_tile_bounds(tile_coords, current_zoom)
+        var u = (lat_lon.y - tile_bounds[0]) / (tile_bounds[2] - tile_bounds[0])
+        var v = 1.0 - (lat_lon.x - tile_bounds[1]) / (tile_bounds[3] - tile_bounds[1])
 
-    var tiles_x = ceil(render_distance / tile_size_m.x) + 2
-    var tiles_z = ceil(render_distance / tile_size_m.y) + 2
+        # Use bilinear interpolation for smoother height sampling
+        var height = sample_height_bilinear(image, u, v) * 0.1
 
-    var chunks_to_keep = {}
-    var collision_chunks_to_keep = {}
+        target_node.global_position.y = height + 1.8  # 1.8m above ground (eye height)
+        print("Positioned player using high-res heightmap: ", height, " meters")
 
-    for tile_i in range(current_tile_i - tiles_z, current_tile_i + tiles_z + 1):
-        for tile_j in range(current_tile_j - tiles_x, current_tile_j + tiles_x + 1):
-            if tile_i >= 0 and tile_i < tiles_number.x and tile_j >= 0 and tile_j < tiles_number.y:
-                var tile_pos = Vector2(tile_i, tile_j)
+func sample_height_bilinear(image: Image, u: float, v: float) -> float:
+    var width = image.get_width()
+    var height = image.get_height()
 
-                for chunk_i in range(0, chunks_per_tile.x):
-                    for chunk_j in range(0, chunks_per_tile.y):
-                        var chunk_key = Vector2(chunk_j, chunk_i)
-                        var chunk_world_pos = calculate_chunk_world_position(tile_pos, chunk_key)
+    var x = u * (width - 1)
+    var y = v * (height - 1)
 
-                        var distance = reference_position.distance_to(chunk_world_pos)
+    var x1 = floor(x)
+    var x2 = min(x1 + 1, width - 1)
+    var y1 = floor(y)
+    var y2 = min(y1 + 1, height - 1)
 
-                        if distance <= render_distance:
-                            var unique_key = str(tile_pos) + "_" + str(chunk_key)
-                            chunks_to_keep[unique_key] = {"tile_pos": tile_pos, "chunk_pos": chunk_key}
+    var q11 = decode_height_from_color(image.get_pixel(x1, y1))
+    var q21 = decode_height_from_color(image.get_pixel(x2, y1))
+    var q12 = decode_height_from_color(image.get_pixel(x1, y2))
+    var q22 = decode_height_from_color(image.get_pixel(x2, y2))
 
-                            if distance <= collision_distance:
-                                collision_chunks_to_keep[unique_key] = true
-                                load_chunk(tile_pos, chunk_key, true)
-                            else:
-                                load_chunk(tile_pos, chunk_key, false)
+    # Bilinear interpolation
+    var x_factor = x - x1
+    var y_factor = y - y1
 
-    var chunks_to_remove = []
-    for tile_pos in tiles.keys():
-        for chunk_pos in tiles[tile_pos].keys():
-            var unique_key = str(tile_pos) + "_" + str(chunk_pos)
-            if not chunks_to_keep.has(unique_key):
-                chunks_to_remove.append({"tile_pos": tile_pos, "chunk_pos": chunk_pos})
+    var top = lerp(q11, q21, x_factor)
+    var bottom = lerp(q12, q22, x_factor)
 
-    for chunk_info in chunks_to_remove:
-        remove_chunk(chunk_info.tile_pos, chunk_info.chunk_pos)
+    return lerp(top, bottom, y_factor)
 
-    for unique_key in chunks_to_keep:
-        var chunk_info = chunks_to_keep[unique_key]
-        var tile_pos = chunk_info.tile_pos
-        var chunk_pos = chunk_info.chunk_pos
+func get_tile_bounds(tile_coords: Vector2i, zoom: int) -> Array:
+    var n = pow(2.0, zoom)
+    var min_lon = (tile_coords.x / n) * 360.0 - 180.0
+    var max_lon = ((tile_coords.x + 1) / n) * 360.0 - 180.0
 
-        if tiles.has(tile_pos) and tiles[tile_pos].has(chunk_pos):
-            var chunk = tiles[tile_pos][chunk_pos]
-            if collision_chunks_to_keep.has(unique_key):
-                if chunk.chunk_state != "WITH_COLLISION":
-                    add_collision_to_chunk(chunk)
-            else:
-                if chunk.chunk_state == "WITH_COLLISION":
-                    remove_collision_from_chunk(chunk)
+    var min_lat = rad_to_deg(atan(sinh(PI * (1.0 - 2.0 * (tile_coords.y + 1) / n))))
+    var max_lat = rad_to_deg(atan(sinh(PI * (1.0 - 2.0 * tile_coords.y / n))))
 
-    var tiles_to_remove = []
-    for tile_pos in tiles.keys():
-        if tiles[tile_pos].is_empty():
-            tiles_to_remove.append(tile_pos)
+    return [min_lon, min_lat, max_lon, max_lat]
 
-    for tile_pos in tiles_to_remove:
-        tiles.erase(tile_pos)
+func rad_to_deg(rad: float) -> float:
+    return rad * 180.0 / PI
 
-    update_debug_info(reference_position, current_tile_i, current_tile_j)
+# Debug function to see loaded tiles
+func get_loaded_tiles_info() -> String:
+    mutex.lock()
+    var info = "Loaded tiles: " + str(loaded_tiles.size()) + "\n"
+    info += "Queue: " + str(download_queue.size()) + "\n"
+    info += "Current zoom: " + str(current_zoom) + "\n"
+    info += "Current tile: " + str(current_tile_coords) + "\n"
+    mutex.unlock()
+    return info
+
+func _input(event):
+    if event is InputEventKey and event.pressed and event.keycode == KEY_SPACE:
+        print("=== TERRAIN DEBUG INFO ===")
+        print("Current tile: ", current_tile_coords, " Zoom: ", current_zoom)
+        print("Player position: ", target_node.global_position)
+        print("Loaded tiles: ", loaded_tiles.size())
+        print("Mesh size: ", terrain_mesh_instance.mesh.size)
+
+        var tile_key = get_tile_key(current_tile_coords, current_zoom)
+        if loaded_tiles.has(tile_key):
+            var texture = loaded_tiles[tile_key]["texture"]
+            var image = texture.get_image()
+            print("Texture size: ", image.get_size())
+
+            # CORRECTED decoding for debug
+            var center_color = image.get_pixel(128, 128)
+            var r = center_color.r * 255.0
+            var g = center_color.g * 255.0
+            var b = center_color.b * 255.0
+            var decoded_height = (r * 256.0 + g + b / 256.0) - 32768.0
+            print("Center pixel color (0-255): ", Vector3(r, g, b))
+            print("Decoded height at center: ", decoded_height, " meters")
+
+
+# Updated timing using Time singleton
+func _process(delta):
+    # Clean up old collision shapes every 10 seconds
+    var current_time = Time.get_ticks_msec()
+    if current_time - last_collision_update > 10000:  # 10 seconds
+        cleanup_old_collision_shapes()
+        last_collision_update = current_time
