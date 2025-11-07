@@ -4,16 +4,11 @@ static func sample_height_at_position(texture: Texture2D, world_pos: Vector3, zo
     var image = texture.get_image()
     var tile_size = CoordinateConverter.get_tile_size_meters(zoom)
 
-    # FIXED: Convert world position to UV coordinates correctly
-    # The mesh is centered at (0,0,0) and spans from -tile_size/2 to tile_size/2
     var u = (world_pos.x + tile_size / 2) / tile_size
     var v = (world_pos.z + tile_size / 2) / tile_size
 
     u = clamp(u, 0.0, 1.0)
     v = clamp(v, 0.0, 1.0)
-
-    # Debug sampling
-    #print("Height sampling - World: ", world_pos, " UV: (", u, ", ", v, ")")
 
     return sample_height_bilinear(image, u, v)
 
@@ -28,7 +23,7 @@ static func sample_height_bilinear(image: Image, u: float, v: float) -> float:
     # Convert UV to image coordinates
     # Note: In images, (0,0) is top-left, but in UV (0,0) is bottom-left
     var x = u * (width - 1)
-    var y = (1.0 - v) * (height - 1)  # Flip V coordinate for image sampling
+    var y = v * (height - 1)
 
     var x1 = floor(x)
     var x2 = min(x1 + 1, width - 1)

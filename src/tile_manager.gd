@@ -25,6 +25,11 @@ var terrain_loader: DynamicTerrainLoader
 
 func setup(loader: DynamicTerrainLoader):
     terrain_loader = loader
+    # Read settings from main node
+    max_concurrent_downloads = terrain_loader.max_concurrent_downloads
+    cache_size = terrain_loader.cache_size
+    download_heightmaps = terrain_loader.download_heightmaps
+    download_normal_maps = terrain_loader.download_normal_maps
     mutex = Mutex.new()
     semaphore = Semaphore.new()
 

@@ -29,3 +29,9 @@ static func get_tile_key(coords: Vector2i, zoom: int) -> String:
 
 static func deg_to_rad(deg: float) -> float:
     return deg * PI / 180.0
+
+static func debug_tile_sizes():
+    print("=== TILE SIZE DEBUG ===")
+    for zoom in range(10, 16):
+        var size = get_tile_size_meters(zoom)
+        print("Zoom ", zoom, ": ", size, " meters")
