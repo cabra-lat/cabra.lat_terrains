@@ -19,12 +19,7 @@ func setup_terrain_mesh():
     terrain_mesh_instance = MeshInstance3D.new()
     terrain_loader.add_child(terrain_mesh_instance)
 
-    var plane_mesh = PlaneMesh.new()
-    plane_mesh.size = Vector2(10, 10)
-    terrain_mesh_instance.mesh = plane_mesh
-
-    shader_material = ShaderMaterial.new()
-    shader_material.shader = preload("../shaders/terrain_shader.gdshader")
+    shader_material = terrain_loader.material
 
     # Set the precomputed normals parameter
     shader_material.set_shader_parameter("use_precomputed_normals", use_precomputed_normals)
@@ -68,6 +63,8 @@ func update_mesh_for_zoom(zoom: int):
     print("Mesh updated for zoom ", zoom, " - Size: ", tile_size_meters, "m")
 
 func _update_terrain_aabb(tile_size_meters: float, height_texture: Texture2D = null):
+    if not is_instance_valid(terrain_mesh_instance.mesh): return
+
     var min_height = -1000.0  # Default minimum
     var max_height = 10000.0  # Default maximum
 

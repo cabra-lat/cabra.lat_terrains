@@ -217,6 +217,7 @@ func load_tile_from_cache(tile_coords: Vector2i, zoom: int, texture_type: int) -
 
     return null
 
+
 func get_tile_cache_path(tile_coords: Vector2i, zoom: int, texture_type: int) -> String:
     var type_path = TileTextureType.get_type_path(texture_type)
     return "user://tile_cache/%s/zoom_%d/%d/%d.png" % [type_path, zoom, tile_coords.x, tile_coords.y]

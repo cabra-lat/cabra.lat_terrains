@@ -1,0 +1,55 @@
+[gd_resource type="ShaderMaterial" load_steps=9 format=3 uid="uid://dkkgw4jjvx0j"]
+
+[ext_resource type="Shader" uid="uid://bnt17fpbhvpwe" path="res://addons/cabra.lat_terrains/shaders/terrain_shader.gdshader" id="1_nklav"]
+[ext_resource type="Texture2D" uid="uid://bivembgj27nvp" path="res://addons/cabra.lat_terrains/resources/sand_procedural_texture.tres" id="2_6ey3n"]
+[ext_resource type="Texture2D" uid="uid://bnywprdl85q7f" path="res://addons/cabra.lat_terrains/resources/dirt_procedural_texture.tres" id="2_pe6oh"]
+[ext_resource type="Texture2D" uid="uid://bjb64jguwpftt" path="res://addons/cabra.lat_terrains/resources/grass_procedural_texture.tres" id="3_6muor"]
+[ext_resource type="Texture2D" uid="uid://dcaq5vexeasfc" path="res://addons/cabra.lat_terrains/resources/snow_procedural_texture.tres" id="3_pe6oh"]
+[ext_resource type="Texture2D" uid="uid://bt634drtj6mgc" path="res://addons/cabra.lat_terrains/resources/stone_procedural_texture.tres" id="4_480rx"]
+
+[sub_resource type="FastNoiseLite" id="FastNoiseLite_480rx"]
+
+[sub_resource type="NoiseTexture2D" id="NoiseTexture2D_7h1g2"]
+noise = SubResource("FastNoiseLite_480rx")
+
+[resource]
+render_priority = 0
+shader = ExtResource("1_nklav")
+shader_parameter/terrain_scale = 1000.0
+shader_parameter/height_scale = 1.0
+shader_parameter/use_precomputed_normals = true
+shader_parameter/ao_strength = 0.85
+shader_parameter/slope_ao_strength = 1.0
+shader_parameter/cavity_ao_strength = 0.415
+shader_parameter/view_ao_strength = 1.275
+shader_parameter/ao_sample_radius = 8.135
+shader_parameter/use_texture_splatting = true
+shader_parameter/texture_sand = ExtResource("2_6ey3n")
+shader_parameter/texture_grass = ExtResource("3_6muor")
+shader_parameter/texture_rock = ExtResource("4_480rx")
+shader_parameter/texture_snow = ExtResource("3_pe6oh")
+shader_parameter/texture_dirt = ExtResource("2_pe6oh")
+shader_parameter/splatmap = SubResource("NoiseTexture2D_7h1g2")
+shader_parameter/noise_texture = SubResource("NoiseTexture2D_7h1g2")
+shader_parameter/sand_scale = Vector2(30, 30)
+shader_parameter/grass_scale = Vector2(1, 1)
+shader_parameter/rock_scale = Vector2(10, 10)
+shader_parameter/snow_scale = Vector2(60, 60)
+shader_parameter/dirt_scale = Vector2(25, 25)
+shader_parameter/height_blend_range = 30.0
+shader_parameter/slope_blend_start = 0.6
+shader_parameter/slope_blend_range = 0.3
+shader_parameter/noise_blend_strength = 0.3
+shader_parameter/water_color = Color(0, 0.3, 0.5, 1)
+shader_parameter/water_level = 810.0
+shader_parameter/shore_foam_width = 5.0
+shader_parameter/shore_darken = 0.3
+shader_parameter/base_roughness = 0.8
+shader_parameter/water_roughness = 0.15
+shader_parameter/snow_roughness = 0.3
+shader_parameter/rock_metallic = 0.1
+shader_parameter/snow_metallic = 0.05
+shader_parameter/sand_level = 900.0
+shader_parameter/grass_level = 920.0
+shader_parameter/rock_level = 1000.0
+shader_parameter/snow_level = 1500.0

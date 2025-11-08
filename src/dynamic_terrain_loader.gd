@@ -32,6 +32,8 @@ extends Node3D
 @export_category("Terrain Mesh Settings")
 @export var use_normal_maps: bool = true
 @export var use_precomputed_normals: bool = true
+@export var shader: Shader = preload("../shaders/terrain_shader.gdshader")
+@export var material: ShaderMaterial = preload("../resources/template_material.tres")
 
 var current_tile_coords: Vector2i
 var time_since_last_update: float = 0.0
@@ -56,13 +58,12 @@ var terrain_mesh_manager: TerrainMeshManager:
 var tile_manager: TileManager:
     get: return _tile_manager
 
-
 func _ready() -> void:
+    RenderingServer.set_debug_generate_wireframes(true)
     _initialize_managers()
     await get_tree().create_timer(3.0).timeout
     call_deferred("update_terrain")
     call_deferred("_spawn_player_at_terrain_safe")
-
 
 func _initialize_managers() -> void:
     _tile_manager = TileManager.new()
