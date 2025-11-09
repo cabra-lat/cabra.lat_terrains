@@ -72,12 +72,11 @@ func _generate_collision_threaded(job: CollisionJob) -> void:
 
 
 func _on_collision_generation_complete(tile_coords: Vector2i, zoom: int, collision_shape: HeightMapShape3D) -> void:
-    var tile_key = CoordinateConverter.get_tile_key(tile_coords, zoom)
+    var tile_key = TileManager.get_tile_key(tile_coords, zoom)
     _collision_shapes[tile_key] = collision_shape
 
     if _should_update_current_collision(tile_coords):
         _update_current_collision_body(collision_shape, tile_coords)
-        _terrain_loader.collision_ready = true
 
     _mutex.lock()
     _active_generations -= 1
@@ -89,11 +88,10 @@ func _on_collision_generation_complete(tile_coords: Vector2i, zoom: int, collisi
 
 
 func _generate_collision_for_tile(job: CollisionJob) -> void:
-    var tile_key = CoordinateConverter.get_tile_key(job.tile_coords, COLLISION_ZOOM_LEVEL)
+    var tile_key = TileManager.get_tile_key(job.tile_coords, COLLISION_ZOOM_LEVEL)
 
     if _collision_shapes.has(tile_key):
         _update_current_collision_body(_collision_shapes[tile_key], job.tile_coords)
-        _terrain_loader.collision_ready = true
         collision_ready.emit(job.tile_coords, COLLISION_ZOOM_LEVEL)
         return
 
@@ -101,7 +99,6 @@ func _generate_collision_for_tile(job: CollisionJob) -> void:
     if collision_shape:
         _collision_shapes[tile_key] = collision_shape
         _update_current_collision_body(collision_shape, job.tile_coords)
-        _terrain_loader.collision_ready = true
         collision_ready.emit(job.tile_coords, COLLISION_ZOOM_LEVEL)
 
 
@@ -166,15 +163,12 @@ func _create_collision_body(shape: HeightMapShape3D) -> StaticBody3D:
     print("Tile size: ", tile_size, "m")
     return static_body
 
-
 func _should_update_current_collision(tile_coords: Vector2i) -> bool:
     return tile_coords == _terrain_loader.current_tile_coords
 
-
 func get_collision_shape(tile_coords: Vector2i) -> HeightMapShape3D:
-    var tile_key = CoordinateConverter.get_tile_key(tile_coords, COLLISION_ZOOM_LEVEL)
+    var tile_key = TileManager.get_tile_key(tile_coords, COLLISION_ZOOM_LEVEL)
     return _collision_shapes.get(tile_key)
-
 
 func cleanup_old_collisions(current_tile_coords: Vector2i, max_keep: int = 3) -> void:
     var tiles_to_remove = []

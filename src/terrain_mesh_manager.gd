@@ -30,12 +30,16 @@ func on_tile_loaded(tile_coords: Vector2i, zoom: int, tile_data: Dictionary):
     update_shader_with_tile(tile_coords, zoom, tile_data)
 
 func update_shader_with_tile(tile_coords: Vector2i, zoom: int, tile_data: Dictionary):
-    if tile_data.has("terrarium"):
-        var height_texture = tile_data["terrarium"]
+    if tile_data.has("heightmap"):
+        var height_texture = tile_data["heightmap"]
         shader_material.set_shader_parameter("heightmap_texture", height_texture)
 
         var tile_size_meters = CoordinateConverter.get_tile_size_meters(zoom)
         _update_terrain_aabb(tile_size_meters, height_texture)  # Pass height texture for accurate AABB
+
+    if tile_data.has("satellite"):
+        var albedo_texture = tile_data["satellite"]
+        shader_material.set_shader_parameter("albedo_texture", albedo_texture)
 
     if use_normal_maps and tile_data.has("normal"):
         var normal_texture = tile_data["normal"]
@@ -111,10 +115,10 @@ func update_for_tile(tile_coords: Vector2i, zoom: int):
     update_mesh_for_zoom(zoom)
 
 func get_terrain_elevation_at_position(world_pos: Vector3) -> float:
-    var tile_data = terrain_loader.tile_manager.get_texture_for_tile(
+    var tile_data = terrain_loader.tile_manager.get_tile_data(
         terrain_loader.current_tile_coords,
         terrain_loader.lod_manager.current_zoom,
-        TileTextureType.TERRARIUM
+        "heightmap"
     )
 
     if tile_data:

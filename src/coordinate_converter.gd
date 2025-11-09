@@ -23,15 +23,3 @@ static func lat_lon_to_tile(lat: float, lon: float, zoom: int) -> Vector2i:
 
 static func get_tile_size_meters(zoom: int) -> float:
     return EARTH_CIRCUMFERENCE / pow(2.0, zoom)
-
-static func get_tile_key(coords: Vector2i, zoom: int) -> String:
-    return "%d_%d_%d" % [coords.x, coords.y, zoom]
-
-static func deg_to_rad(deg: float) -> float:
-    return deg * PI / 180.0
-
-static func debug_tile_sizes():
-    print("=== TILE SIZE DEBUG ===")
-    for zoom in range(10, 16):
-        var size = get_tile_size_meters(zoom)
-        print("Zoom ", zoom, ": ", size, " meters")

@@ -37,8 +37,6 @@ extends Node3D
 
 var current_tile_coords: Vector2i
 var time_since_last_update: float = 0.0
-var collision_ready: bool = false
-var waiting_for_collision: bool = false
 
 var _tile_manager: TileManager
 var _collision_manager: CollisionManager
@@ -66,9 +64,6 @@ func _ready() -> void:
     call_deferred("_spawn_player_at_terrain_safe")
 
 func _initialize_managers() -> void:
-    _tile_manager = TileManager.new()
-    _tile_manager.setup(self)
-    add_child(_tile_manager)
 
     _collision_manager = CollisionManager.new()
     _collision_manager.setup(self)
@@ -83,15 +78,14 @@ func _initialize_managers() -> void:
     _terrain_mesh_manager.setup(self)
     add_child(_terrain_mesh_manager)
 
+    _tile_manager = TileManager.new()
+    _tile_manager.setup(self)
+    _tile_manager.tile_loaded.connect(_terrain_mesh_manager.on_tile_loaded)
+    add_child(_tile_manager)
 
 func _on_collision_ready(tile_coords: Vector2i, zoom: int) -> void:
-    collision_ready = true
     print("High-res collision ready for tile: ", tile_coords)
-
-    if waiting_for_collision:
-        waiting_for_collision = false
-        call_deferred("_spawn_player_at_terrain_safe")
-
+    call_deferred("_spawn_player_at_terrain_safe")
 
 func _physics_process(delta: float) -> void:
     time_since_last_update += delta
@@ -100,7 +94,6 @@ func _physics_process(delta: float) -> void:
     if time_since_last_update >= update_interval:
         time_since_last_update = 0.0
         update_terrain()
-
 
 func update_terrain() -> void:
     if not target_node:
@@ -121,25 +114,24 @@ func update_terrain() -> void:
 
         _load_new_terrain(new_tile_coords, new_zoom)
 
-
 func _load_new_terrain(tile_coords: Vector2i, zoom: int) -> void:
-    _tile_manager.load_tile_and_neighbors(tile_coords, zoom)
+    _tile_manager.preload_tile(tile_coords, zoom)
+    _tile_manager.preload_tile(tile_coords + Vector2i.LEFT,  zoom)
+    _tile_manager.preload_tile(tile_coords + Vector2i.RIGHT, zoom)
+    _tile_manager.preload_tile(tile_coords + Vector2i.UP,    zoom)
+    _tile_manager.preload_tile(tile_coords + Vector2i.DOWN,  zoom)
     _terrain_mesh_manager.update_for_tile(tile_coords, zoom)
     _load_collision_tile(tile_coords)
 
-
 func _load_collision_tile(tile_coords: Vector2i) -> void:
     # Always use highest detail for collision (zoom 15)
-    var collision_texture = _tile_manager.get_texture_for_tile(tile_coords, _collision_manager.COLLISION_ZOOM_LEVEL, TileTextureType.TERRARIUM)
+    var collision_texture = _tile_manager.get_tile_data(tile_coords, _collision_manager.COLLISION_ZOOM_LEVEL,"heightmap")
 
     if collision_texture:
         print("Loading high-res collision for tile: ", tile_coords)
         _collision_manager.queue_collision_generation(tile_coords, collision_texture)
-        waiting_for_collision = true
-        collision_ready = false
     else:
         print("No high-res texture available for collision at tile: ", tile_coords)
-
 
 func _spawn_player_at_terrain_safe() -> void:
     if not target_node:
@@ -148,7 +140,7 @@ func _spawn_player_at_terrain_safe() -> void:
     var player_xz = Vector3(target_node.global_position.x, 0, target_node.global_position.z)
     var elevation = _terrain_mesh_manager.get_terrain_elevation_at_position(player_xz)
 
-    if _is_valid_elevation(elevation):
+    if not _is_valid_elevation(elevation):
         var new_position = Vector3(
             target_node.global_position.x,
             elevation + 1.8,  # Eye height
@@ -158,14 +150,12 @@ func _spawn_player_at_terrain_safe() -> void:
         print("Spawning player at terrain elevation: ", elevation, "m")
         target_node.global_position = new_position
         _reset_player_physics()
-        waiting_for_collision = false
     else:
         print("Invalid elevation detected: ", elevation)
 
 
 func _is_valid_elevation(elevation: float) -> bool:
     return elevation > -1000 and elevation < 10000
-
 
 func _reset_player_physics() -> void:
     if target_node is CharacterBody3D:
@@ -202,10 +192,6 @@ func _debug_terrain_info() -> void:
     print("Terrain elevation at player: ", elevation, "m")
     print("Player height above terrain: ", height_above_terrain, "m")
     print("LOD using height above terrain: ", height_above_terrain, "m")
-
-    print("Collision ready: ", collision_ready)
-    print("Waiting for collision: ", waiting_for_collision)
-
 
 func _debug_terrain_collision_status() -> void:
     print("=== TERRAIN/COLLISION STATUS ===")
