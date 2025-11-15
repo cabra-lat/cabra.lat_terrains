@@ -18,8 +18,8 @@ extends Node3D
 @export var use_threading: bool = false
 
 @export_category("LOD Settings")
-@export var min_zoom: int = 15
-@export var max_zoom: int = 10
+@export var min_zoom: int = 10
+@export var max_zoom: int = 15
 @export var lod_max_height: float = 8000.0
 @export var lod_min_height: float = 50.0
 
@@ -64,10 +64,8 @@ func _ready() -> void:
     call_deferred("_spawn_player_at_terrain_safe")
 
 func _initialize_managers() -> void:
-
     _collision_manager = CollisionManager.new()
     _collision_manager.setup(self)
-    _collision_manager.collision_ready.connect(_on_collision_ready)
     add_child(_collision_manager)
 
     _lod_manager = LODManager.new()
@@ -81,15 +79,11 @@ func _initialize_managers() -> void:
     _tile_manager = TileManager.new()
     _tile_manager.setup(self)
     _tile_manager.tile_loaded.connect(_terrain_mesh_manager.on_tile_loaded)
+    _tile_manager.tile_loaded.connect(_collision_manager.on_tile_loaded)
     add_child(_tile_manager)
-
-func _on_collision_ready(tile_coords: Vector2i, zoom: int) -> void:
-    print("High-res collision ready for tile: ", tile_coords)
-    call_deferred("_spawn_player_at_terrain_safe")
 
 func _physics_process(delta: float) -> void:
     time_since_last_update += delta
-    _collision_manager.process_queue()
 
     if time_since_last_update >= update_interval:
         time_since_last_update = 0.0
@@ -106,7 +100,8 @@ func update_terrain() -> void:
     var height_above_terrain = max(0.0, player_pos.y - terrain_height)
 
     var new_zoom = _lod_manager.calculate_dynamic_zoom(height_above_terrain)
-    var new_tile_coords = CoordinateConverter.world_to_tile_coords(player_pos, start_latitude, start_longitude, new_zoom)
+    var origin = CoordinateConverter.lat_lon_to_world(start_latitude, start_longitude, new_zoom)
+    var new_tile_coords = CoordinateConverter.world_to_tile(player_pos + origin, new_zoom)
 
     if new_tile_coords != current_tile_coords or new_zoom != _lod_manager.current_zoom:
         current_tile_coords = new_tile_coords
@@ -116,22 +111,8 @@ func update_terrain() -> void:
 
 func _load_new_terrain(tile_coords: Vector2i, zoom: int) -> void:
     _tile_manager.preload_tile(tile_coords, zoom)
-    _tile_manager.preload_tile(tile_coords + Vector2i.LEFT,  zoom)
-    _tile_manager.preload_tile(tile_coords + Vector2i.RIGHT, zoom)
-    _tile_manager.preload_tile(tile_coords + Vector2i.UP,    zoom)
-    _tile_manager.preload_tile(tile_coords + Vector2i.DOWN,  zoom)
     _terrain_mesh_manager.update_for_tile(tile_coords, zoom)
-    _load_collision_tile(tile_coords)
-
-func _load_collision_tile(tile_coords: Vector2i) -> void:
-    # Always use highest detail for collision (zoom 15)
-    var collision_texture = _tile_manager.get_tile_data(tile_coords, _collision_manager.COLLISION_ZOOM_LEVEL,"heightmap")
-
-    if collision_texture:
-        print("Loading high-res collision for tile: ", tile_coords)
-        _collision_manager.queue_collision_generation(tile_coords, collision_texture)
-    else:
-        print("No high-res texture available for collision at tile: ", tile_coords)
+    current_tile_coords = tile_coords  # Add this
 
 func _spawn_player_at_terrain_safe() -> void:
     if not target_node:
@@ -162,52 +143,6 @@ func _reset_player_physics() -> void:
         target_node.velocity = Vector3.ZERO
     elif target_node.has_method("set_velocity"):
         target_node.set_velocity(Vector3.ZERO)
-
-
-func _input(event: InputEvent) -> void:
-    if not event is InputEventKey or not event.pressed:
-        return
-
-    match event.keycode:
-        KEY_SPACE:
-            _debug_terrain_info()
-        KEY_P:
-            _spawn_player_at_terrain_safe()
-        KEY_L:
-            _lod_manager.debug_lod_status(target_node)
-        KEY_C:
-            _collision_manager.debug_status()
-        KEY_T:
-            _debug_terrain_collision_status()
-
-
-func _debug_terrain_info() -> void:
-    print("=== TERRAIN DEBUG INFO ===")
-    print("Current tile: ", current_tile_coords, " Zoom: ", _lod_manager.current_zoom)
-    print("Collision zoom: ", _collision_manager.COLLISION_ZOOM_LEVEL)
-    print("Player position: ", target_node.global_position)
-
-    var elevation = _terrain_mesh_manager.get_terrain_elevation_at_position(target_node.global_position)
-    var height_above_terrain = target_node.global_position.y - elevation
-    print("Terrain elevation at player: ", elevation, "m")
-    print("Player height above terrain: ", height_above_terrain, "m")
-    print("LOD using height above terrain: ", height_above_terrain, "m")
-
-func _debug_terrain_collision_status() -> void:
-    print("=== TERRAIN/COLLISION STATUS ===")
-    print("Current visual tile: ", current_tile_coords, " Zoom: ", _lod_manager.current_zoom)
-    print("Collision zoom level: ", _collision_manager.COLLISION_ZOOM_LEVEL)
-
-    if _collision_manager._current_collision_body:
-        var collision_shape_node = _collision_manager._current_collision_body.get_child(0) as CollisionShape3D
-        if collision_shape_node:
-            print("Collision Body Scale: ", collision_shape_node.scale)
-
-    if target_node:
-        var player_pos = target_node.global_position
-        var visual_elevation = _terrain_mesh_manager.get_terrain_elevation_at_position(player_pos)
-        print("Player elevation - Visual: ", visual_elevation, "m, Actual: ", player_pos.y, "m")
-
 
 func _exit_tree() -> void:
     _tile_manager.cleanup()

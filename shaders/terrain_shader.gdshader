@@ -6,7 +6,8 @@ uniform sampler2D albedo_texture: source_color, filter_nearest;
 uniform float terrain_scale = 1000.0;
 uniform float height_scale = 1.0; // 1:1 height scale
 uniform bool use_precomputed_normals = true;
-
+uniform float min_height = -1000.0;
+uniform float max_height = 10000.0;
 // Topographic colors
 uniform vec3 deep_water_color: source_color = vec3(0.0, 0.1, 0.3);
 uniform vec3 shallow_water_color: source_color = vec3(0.0, 0.3, 0.6);
@@ -32,7 +33,8 @@ float decode_height(vec4 color) {
     float r = floor(color.r * 255.0);
     float g = floor(color.g * 255.0);
     float b = floor(color.b * 255.0); // floor is important here to avoid moiré patterns
-    return (r * 256.0 + g + b / 256.0) - 32768.0;
+    float h = floor((r * 256.0 + g + b / 256.0) - 32768.0);
+    return clamp(h, min_height, max_height);
 }
 
 // Calculate normal from heightmap with proper scale

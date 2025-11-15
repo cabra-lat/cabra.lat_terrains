@@ -20,7 +20,7 @@ func setup(loader: DynamicTerrainLoader):
 func calculate_dynamic_zoom(height_above_terrain: float) -> int:
     var effective_height = max(0.0, height_above_terrain - lod_min_height)
     var t = clamp(effective_height / lod_max_height, 0.0, 1.0)
-    return int(lerp(float(min_zoom), float(max_zoom), t))
+    return int(lerp(float(max_zoom), float(min_zoom), t))
 
 func debug_lod_status(target_node: Node3D):
     if not target_node:
