@@ -35,20 +35,30 @@ static func sample_height(texture: Texture2D, percent: float = 0.05) -> Vector2:
 
     return Vector2(min_height, max_height)
 
-static func sample_height_at_position(texture: Texture2D, world_pos: Vector3, zoom: int) -> float:
-    var image = texture.get_image()
-    var tile_size = CoordinateConverter.get_tile_size_meters(zoom)
-
-    var u = (world_pos.x + tile_size / 2) / tile_size
-    var v = (world_pos.z + tile_size / 2) / tile_size
-
-    u = clamp(u, 0.0, 1.0)
-    v = clamp(v, 0.0, 1.0)
-
-    return sample_height_bilinear(image, u, v)
+#static func sample_height_at_position(texture: Texture2D, world_pos: Vector3, tile_coords: Vector2i, zoom: int) -> float:
+    #var image = texture.get_image()
+    #var tile_size = CoordinateConverter.get_tile_size_meters(zoom)
+#
+    ## Get tile corner position relative to spawn
+    #var tile_corner = CoordinateConverter.get_precise_world_pos(tile_coords, zoom)
+#
+    ## Calculate UVs relative to tile corner
+    #var u = (world_pos.x - tile_corner.x) / tile_size
+    #var v = (world_pos.z - tile_corner.z) / tile_size
+#
+    #u = clamp(u, 0.0, 1.0)
+    #v = clamp(v, 0.0, 1.0)
+#
+    #return sample_height_bilinear(image, u, v)
 
 static func sample_height_at_uv(texture: Texture2D, u: float, v: float) -> float:
+    if not texture or not texture.get_image():
+        return 0.0
+
     var image = texture.get_image()
+    if image.is_empty():
+        return 0.0
+
     return sample_height_bilinear(image, u, v)
 
 static func sample_height_bilinear(image: Image, u: float, v: float) -> float:

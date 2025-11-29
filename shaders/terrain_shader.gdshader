@@ -1,4 +1,5 @@
 shader_type spatial;
+render_mode cull_disabled;
 
 uniform sampler2D heightmap_texture: hint_default_black, source_color, repeat_disable, filter_nearest;
 uniform sampler2D normalmap_texture: hint_normal;
