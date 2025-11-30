@@ -8,9 +8,11 @@ class_name TileTerrainRoot
 @export var centre_longitude: float = -48.56 : set = _set_centre_longitude
 @export var zoom: int = 18 : set = _set_zoom
 @export var layer: String = "googlemt" : set = _set_layer
-@export_range(1, 9, 2) var grid_radius: int = 3 : set = _set_grid_radius
-@export var terrain_scale: float = 1000.0 : set = _set_terrain_scale
+@export_range(1, 100, 2) var grid_radius: int = 3 : set = _set_grid_radius
 @export var add_collision: bool = true : set = _set_add_collision
+
+# Use a simpler, direct initialization syntax:
+@export_tool_button("Update") var _button_action: Callable
 
 # Internal tile coordinates
 var centre_tile: Vector2i = Vector2i.ZERO
@@ -19,50 +21,39 @@ var tile_manager: TileManager
 # Proper setters for TileTerrainRoot
 func _set_centre_latitude(value: float) -> void:
     centre_latitude = value
-    _update_centre_tile()
-    if Engine.is_editor_hint() and is_inside_tree():
-        call_deferred("_build")
+    CoordinateConverter.set_origin_from_tile(centre_tile, zoom)
 
 func _set_centre_longitude(value: float) -> void:
     centre_longitude = value
-    _update_centre_tile()
-    if Engine.is_editor_hint() and is_inside_tree():
-        call_deferred("_build")
+    CoordinateConverter.set_origin_from_tile(centre_tile, zoom)
 
 func _set_zoom(value: int) -> void:
     zoom = value
-    _update_centre_tile()
-    if Engine.is_editor_hint() and is_inside_tree():
-        call_deferred("_build")
+    CoordinateConverter.set_origin_from_tile(centre_tile, zoom)
 
 func _set_layer(value: String) -> void:
     layer = value
-    if Engine.is_editor_hint() and is_inside_tree():
-        call_deferred("_build")
 
 func _set_grid_radius(value: int) -> void:
     grid_radius = value
-    if Engine.is_editor_hint() and is_inside_tree():
-        call_deferred("_build")
-
-func _set_terrain_scale(value: float) -> void:
-    terrain_scale = value
-    if Engine.is_editor_hint() and is_inside_tree():
-        call_deferred("_build")
 
 func _set_add_collision(value: bool) -> void:
     add_collision = value
-    if Engine.is_editor_hint() and is_inside_tree():
-        call_deferred("_build")
 
 func _update_centre_tile():
     # Convert lat/lon to tile coordinates
     centre_tile = CoordinateConverter.lat_lon_to_tile(centre_latitude, centre_longitude, zoom)
     print("Centre coordinates: lat=", centre_latitude, " lon=", centre_longitude, " -> tile=", centre_tile)
+    CoordinateConverter.set_origin_from_tile(centre_tile, zoom)
+    if Engine.is_editor_hint() and is_inside_tree():
+        call_deferred("_build")
+
+func _enter_tree():
+    # Initialize the Callable safely here
+    _button_action = Callable(self, "_update_centre_tile")
 
 func _ready() -> void:
     _update_centre_tile()
-    CoordinateConverter.set_origin_from_tile(centre_tile, zoom)
 
     # Create TileManager with threaded downloader
     if not is_instance_valid(tile_manager):
@@ -152,10 +143,11 @@ func _build(_v = null) -> void:
 
             # Only set owner if we're in the editor and have a valid scene root
             if Engine.is_editor_hint() and is_inside_tree() and get_tree().edited_scene_root != null:
-                tile_root.owner = get_tree().edited_scene_root
-                mesh.owner = get_tree().edited_scene_root
-                for child in tile_root.get_children():
-                    child.owner = get_tree().edited_scene_root
+                pass
+                #tile_root.owner = get_tree().edited_scene_root
+                #mesh.owner = get_tree().edited_scene_root
+                #for child in tile_root.get_children():
+                #    child.owner = get_tree().edited_scene_root
     _check_download_status()
     # Debug: Print tile positions in a grid format
     print("=== TILE POSITIONS GRID ===")

@@ -118,7 +118,7 @@ func _create_heightmap_collision(parent_col: StaticBody3D, tile_size: float, hei
 
     # Set owner for proper scene saving
     if Engine.is_editor_hint() and is_inside_tree() and get_tree().edited_scene_root != null:
-        collision_shape.owner = get_tree().edited_scene_root
+        pass #collision_shape.owner = get_tree().edited_scene_root
 
     print("Heightmap collision created for tile: ", tile_coord)
 
