@@ -1,6 +1,9 @@
 @tool
-extends Node3D
+extends StaticBody3D
 class_name TileTerrainRoot
+
+const base_resolution = 32  # Base vertices (without border)
+const border_vertices = 1   # Extra vertices on each side
 
 # User-friendly lat/lon inputs
 @export var centre_latitude: float = -6.084 : set = _set_centre_latitude
@@ -30,14 +33,14 @@ var atlas_built: bool = false
 var tile_height_ranges: Dictionary = {}  # Store min/max height per tile
 
 func _enter_tree() -> void:
-   update_button = Callable(self, "_set_update_button")
+    update_button = Callable(self, "_set_update_button")
 
 # Setters
 func _set_save_in_scene(value: float) -> void:
     save_in_scene = value
     if not save_in_scene:
-      for c in get_children():
-        remove_child(c)
+        for c in get_children():
+            remove_child(c)
 
 func _set_centre_latitude(value: float) -> void:
     centre_latitude = value
@@ -62,6 +65,8 @@ func _update_centre_tile():
 
 func _ready() -> void:
     _update_centre_tile()
+    if not Engine.is_editor_hint():
+        call_deferred("_build")
 
     if not is_instance_valid(tile_manager):
         tile_manager = TileManager.new()
@@ -129,8 +134,27 @@ func _build_atlases() -> void:
         albedo_atlas = albedo_atlas_data.texture
         heightmap_atlas = heightmap_atlas_data.texture
         normalmap_atlas = normalmap_atlas_data.texture
-        uv_offsets = heightmap_atlas_data.offsets
-        uv_scales = heightmap_atlas_data.scales
+
+        # Ensure dictionaries use Vector2i keys
+        uv_offsets.clear()
+        uv_scales.clear()
+
+        # Check what type of keys the atlas data uses and convert to Vector2i
+        for key in heightmap_atlas_data.offsets:
+            var tile_coords: Vector2i
+            if typeof(key) == TYPE_STRING:
+                # Convert string like "(x, y)" to Vector2i
+                var str_parts = key.replace("(", "").replace(")", "").split(",")
+                tile_coords = Vector2i(int(str_parts[0]), int(str_parts[1]))
+            elif typeof(key) == TYPE_ARRAY:
+                # Convert array to Vector2i
+                tile_coords = Vector2i(key[0], key[1])
+            else:
+                # Assume it's already Vector2i
+                tile_coords = key
+
+            uv_offsets[tile_coords] = heightmap_atlas_data.offsets[key]
+            uv_scales[tile_coords] = heightmap_atlas_data.scales[key]
 
         # Pre-calculate height ranges for all tiles
         _calculate_all_tile_height_ranges()
@@ -143,8 +167,224 @@ func _build_atlases() -> void:
 
         # Create the tile meshes with atlas textures
         _create_tile_meshes()
+
+        # Build the single big collider
+        if add_collision:
+            var collider = _build_single_big_collider()
+            if save_in_scene and Engine.is_editor_hint() and get_tree().edited_scene_root:
+                collider.owner = get_tree().edited_scene_root
     else:
         print("Only zoom 18 is supported for atlas mode")
+func _build_single_big_collider() -> CollisionShape3D:
+    if not heightmap_atlas or not is_instance_valid(heightmap_atlas):
+        print("Cannot build big collider: heightmap atlas not available")
+        return null
+
+    var heightmap_image = heightmap_atlas.get_image()
+    if not heightmap_image or heightmap_image.is_empty():
+        print("Cannot build big collider: heightmap image is empty")
+        return null
+
+    if grid_tiles.is_empty():
+        print("Cannot build big collider: no tiles in grid")
+        return null
+
+    # Determine grid bounds
+    var min_tile_x = INF
+    var max_tile_x = -INF
+    var min_tile_y = INF
+    var max_tile_y = -INF
+    for coords in grid_tiles:
+        if coords is Vector2i:
+            min_tile_x = min(min_tile_x, coords.x)
+            max_tile_x = max(max_tile_x, coords.x)
+            min_tile_y = min(min_tile_y, coords.y)
+            max_tile_y = max(max_tile_y, coords.y)
+
+    var grid_width_tiles = int(max_tile_x - min_tile_x + 1)
+    var grid_height_tiles = int(max_tile_y - min_tile_y + 1)
+
+    # Match PlaneMesh resolution exactly
+    var verts_per_tile = 32          # = 31 subdivisions + 1
+    var quads_per_tile = 31          # = verts_per_tile - 1
+
+    # Total vertex count: shared borders included
+    var total_verts_x = grid_width_tiles * quads_per_tile
+    var total_verts_z = grid_height_tiles * quads_per_tile
+
+    var tile_size = CoordinateConverter.get_tile_size_meters(zoom)
+    var scale_xz = tile_size / float(quads_per_tile - 0.15) # meters between vertices
+
+    var atlas_width = heightmap_image.get_width()
+    var atlas_height = heightmap_image.get_height()
+
+    var height_data = PackedFloat32Array()
+    height_data.resize(total_verts_x * total_verts_z)
+
+    # Sample height data to match shader vertex displacement exactly
+    for z in range(total_verts_z):
+        for x in range(total_verts_x):
+            # Determine which tile this vertex belongs to
+            var tile_x = min_tile_x + int(x / quads_per_tile)
+            var tile_y = min_tile_y + int(z / quads_per_tile)
+            var tile_coords = Vector2i(tile_x, tile_y)
+
+            if not uv_offsets.has(tile_coords):
+                height_data[z * total_verts_x + x] = 0.0
+                continue
+
+            var uv_offset = uv_offsets[tile_coords]
+            var uv_scale = uv_scales[tile_coords]
+
+            # Compute local UV within tile [0.0, 1.0] inclusive
+            var local_u = float(x % quads_per_tile) / float(quads_per_tile)
+            var local_v = float(z % quads_per_tile) / float(quads_per_tile)
+
+            # Transform to atlas UV
+            var atlas_u = uv_offset.x + local_u * uv_scale.x
+            var atlas_v = uv_offset.y + local_v * uv_scale.y
+
+            # Nearest sampling (matches filter_nearest in shader)
+            var pixel_x = int(roundi(atlas_u * atlas_width))
+            var pixel_y = int(roundi(atlas_v * atlas_height))
+            pixel_x = clamp(pixel_x, 0, atlas_width - 1)
+            pixel_y = clamp(pixel_y, 0, atlas_height - 1)
+            var color = heightmap_image.get_pixel(pixel_x, pixel_y)
+            var raw_height = HeightSampler.decode_height_from_color(color)
+
+            # Pre-scale Y so that uniform scale produces correct world height
+            height_data[z * total_verts_x + x] = (raw_height) / scale_xz
+
+    # Create collision shape
+    var heightmap_shape = HeightMapShape3D.new()
+    heightmap_shape.map_width = total_verts_x
+    heightmap_shape.map_depth = total_verts_z
+    heightmap_shape.map_data = height_data
+
+    var collision_shape = CollisionShape3D.new()
+    collision_shape.shape = heightmap_shape
+    # Uniform scale as required
+    collision_shape.scale = Vector3(scale_xz, scale_xz, scale_xz)
+
+    # Position at bottom-left corner of the grid (matches shader world origin)
+    #var corner_pos = CoordinateConverter.tile_to_world(Vector2i(min_tile_x, min_tile_y), zoom)
+    #collision_shape.position = corner_pos
+
+    add_child(collision_shape)
+    collision_shape.name = "big_collider"
+    if Engine.is_editor_hint() and get_tree().edited_scene_root:
+        collision_shape.owner = get_tree().edited_scene_root
+
+    print("Big collider built: %dx%d vertices, scale=%.3f" % [total_verts_x, total_verts_z, scale_xz])
+    return collision_shape
+#func _build_single_big_collider() -> CollisionShape3D:
+    #if not heightmap_atlas or not is_instance_valid(heightmap_atlas):
+        #print("Cannot build big collider: heightmap atlas not available")
+        #return null
+#
+    #var heightmap_image = heightmap_atlas.get_image()
+    #if not heightmap_image or heightmap_image.is_empty():
+        #print("Cannot build big collider: heightmap image is empty")
+        #return null
+#
+    #if grid_tiles.is_empty():
+        #print("Cannot build big collider: no tiles in grid")
+        #return null
+#
+    ## Calculate grid bounds
+    #var min_tile_x = INF
+    #var max_tile_x = -INF
+    #var min_tile_y = INF
+    #var max_tile_y = -INF
+#
+    #for coords in grid_tiles:
+        #if coords is Vector2i:
+            #min_tile_x = min(min_tile_x, coords.x)
+            #max_tile_x = max(max_tile_x, coords.x)
+            #min_tile_y = min(min_tile_y, coords.y)
+            #max_tile_y = max(max_tile_y, coords.y)
+#
+    #var grid_width_tiles = int(max_tile_x - min_tile_x + 1)
+    #var grid_height_tiles = int(max_tile_y - min_tile_y + 1)
+#
+    ## **EXACT VERTEX COUNT**: (N tiles * 31 quads) + 1 vertex
+    #var verts_per_tile = 32
+    #var quads_per_tile = verts_per_tile - 1
+    #var total_verts_x = grid_width_tiles * quads_per_tile + 1
+    #var total_verts_z = grid_height_tiles * quads_per_tile + 1
+#
+    #var tile_size = CoordinateConverter.get_tile_size_meters(zoom)
+#
+    ## **EXACT SCALE**: tile_size / 31 matches PlaneMesh subdivision
+    #var scale_xz = tile_size / float(quads_per_tile)
+#
+    #var atlas_width = heightmap_image.get_width()
+    #var atlas_height = heightmap_image.get_height()
+#
+    #var height_data = PackedFloat32Array()
+    #height_data.resize(total_verts_x * total_verts_z)
+#
+    ## **VERTEX-FOR-VERTEX SAMPLING**: Replicate shader exactly
+    #for z in range(total_verts_z):
+        #for x in range(total_verts_x):
+            ## Determine tile coordinates
+            #var tile_x = min_tile_x + int(x / quads_per_tile)
+            #var tile_y = min_tile_y + int(z / quads_per_tile)
+            #var tile_coords = Vector2i(tile_x, tile_y)
+#
+            #if not uv_offsets.has(tile_coords):
+                #height_data[z * total_verts_x + x] = 0.0
+                #continue
+#
+            #var uv_offset = uv_offsets[tile_coords]
+            #var uv_scale = uv_scales[tile_coords]
+#
+            ## **EXACT LOCAL UV**: Same as shader's PlaneMesh UV
+            #var local_u = float(x % quads_per_tile) / float(quads_per_tile)
+            #var local_v = float(z % quads_per_tile) / float(quads_per_tile)
+#
+            ## **EXACT TRANSFORM**: uv_offset + local_uv * uv_scale (shader formula)
+            #var atlas_u = uv_offset.x + local_u * uv_scale.x
+            #var atlas_v = uv_offset.y + local_v * uv_scale.y
+#
+            ## **EXACT SAMPLING**: Nearest-neighbor (floor) matches filter_nearest
+            #var pixel_x = floor(atlas_u * atlas_width)
+            #var pixel_y = floor(atlas_v * atlas_height)
+            #pixel_x = clamp(pixel_x, 0, atlas_width - 1)
+            #pixel_y = clamp(pixel_y, 0, atlas_height - 1)
+#
+            ## **EXACT HEIGHT DECODE**: Matches shader (no extra floor!)
+            #var color = heightmap_image.get_pixel(pixel_x, pixel_y)
+            #var r = floor(color.r * 255.0)
+            #var g = floor(color.g * 255.0)
+            #var b = floor(color.b * 255.0)
+            #var height = (r * 256.0 + g + b / 256.0) - 32768.0
+#
+            ## Store height compensated for uniform scaling
+            #height_data[z * total_verts_x + x] = height / scale_xz
+#
+    ## Create shape with EXACT topology
+    #var heightmap_shape = HeightMapShape3D.new()
+    #heightmap_shape.map_width = total_verts_x
+    #heightmap_shape.map_depth = total_verts_z
+    #heightmap_shape.map_data = height_data
+#
+    #var collision_shape = CollisionShape3D.new()
+    #collision_shape.shape = heightmap_shape
+    #collision_shape.scale = Vector3(scale_xz, scale_xz, scale_xz)
+#
+    ## **EXACT POSITION**: Align bottom-left vertex with shader's bottom-left vertex
+    ##var corner_tile_center = CoordinateConverter.tile_to_world(Vector2i(min_tile_x, min_tile_y), zoom)
+    ##collision_shape.position = corner_tile_center - Vector3(tile_size/2.0, 0, tile_size/2.0)
+#
+    #add_child(collision_shape)
+    #collision_shape.name = "big_collider"
+#
+    #if save_in_scene and Engine.is_editor_hint() and get_tree().edited_scene_root:
+        #collision_shape.owner = get_tree().edited_scene_root
+#
+    #print("Big collider: ", total_verts_x, "x", total_verts_z, " verts, scale=", scale_xz, " pos=", collision_shape.position)
+    #return collision_shape
 
 func _calculate_all_tile_height_ranges():
     tile_height_ranges.clear()
@@ -264,7 +504,7 @@ func _build_albedo_atlas() -> Dictionary:
         # Blit tile to atlas
         atlas_image.blit_rect(tile_image, Rect2i(0, 0, tile_size, tile_size), Vector2i(atlas_x, atlas_y))
 
-        # Store UV data
+        # Store UV data with Vector2i keys
         var atlas_size = Vector2(atlas_image.get_size())
         atlas_data.offsets[coords] = Vector2(atlas_x, atlas_y) / atlas_size
         atlas_data.scales[coords] = Vector2(tile_size, tile_size) / atlas_size
@@ -289,7 +529,7 @@ func _create_tile_meshes() -> void:
             print("Creating mesh for tile: ", tile)
 
             # Create tile container
-            var tile_root = StaticBody3D.new() if add_collision else Node3D.new()
+            var tile_root = Node3D.new()
             tile_root.name = "tile_%d_%d" % [tile.x, tile.y]
 
             # Create mesh instance
@@ -311,14 +551,6 @@ func _create_tile_meshes() -> void:
             # Set position
             var world_pos = CoordinateConverter.tile_to_world(tile, zoom)
 
-            # Add collision if enabled
-            var collisor = null
-            if add_collision:
-                collisor = _add_collision_to_tile(tile, actual_tile_size, min_height)
-                if collisor:
-                    collisor.position.y = min_height
-                    tile_root.add_child(collisor)
-
             tile_root.position = world_pos
             mesh_inst.position = Vector3.ZERO
 
@@ -331,7 +563,6 @@ func _create_tile_meshes() -> void:
             if save_in_scene and Engine.is_editor_hint() and get_tree().edited_scene_root:
                 tile_root.owner = get_tree().edited_scene_root
                 mesh_inst.owner = get_tree().edited_scene_root
-                if collisor: collisor.owner = get_tree().edited_scene_root
 
 func _set_tile_aabb(mesh_inst: MeshInstance3D, tile_size: float, min_height: float, max_height: float):
     # Calculate AABB that encompasses the entire terrain tile
@@ -351,109 +582,6 @@ func _set_tile_aabb(mesh_inst: MeshInstance3D, tile_size: float, min_height: flo
     mesh_inst.extra_cull_margin = height_range * 0.5 + tile_size * 0.1
 
     print("Set AABB for tile: min=", min_height, " max=", max_height, " center=", center_height)
-
-func _add_collision_to_tile(tile_coords: Vector2i, tile_size: float, min_height: float) -> CollisionShape3D:
-    # Create heightmap collision shape with scaled height data for uniform scaling
-    var heightmap_shape = _create_heightmap_collision_shape(tile_coords, tile_size, min_height)
-    var collision_shape = CollisionShape3D.new()
-
-    if heightmap_shape:
-        collision_shape.shape = heightmap_shape
-
-        # Calculate uniform scale factor
-        var mesh_vertices_per_side = 32  # 31 subdivisions = 32 vertices
-        var horizontal_scale_factor = tile_size / (mesh_vertices_per_side - 1)
-
-        # We want uniform scaling, so we need to scale the height data in the shape
-        # to match the horizontal scale. HeightMapShape3D assumes 1 unit per grid cell.
-        # We'll scale everything uniformly by horizontal_scale_factor.
-        collision_shape.scale = Vector3(horizontal_scale_factor, horizontal_scale_factor, horizontal_scale_factor)
-
-        # Position the collision shape to center it
-        collision_shape.position = Vector3.ZERO
-
-        print("Added uniformly scaled heightmap collision to tile: ", tile_coords,
-              " with scale: ", collision_shape.scale)
-    else:
-        # Fallback to box collision
-        var box_shape = BoxShape3D.new()
-        var height_range = tile_height_ranges.get(tile_coords, Vector2(0.0, 1000.0))
-        box_shape.size = Vector3(tile_size, height_range.y - height_range.x, tile_size)
-        collision_shape.shape = box_shape
-        collision_shape.position = Vector3(0, (height_range.x + height_range.y) * 0.5, 0)
-
-        print("Added box collision to tile: ", tile_coords)
-
-    return collision_shape
-
-func _create_heightmap_collision_shape(tile_coords: Vector2i, tile_size: float, min_height: float) -> HeightMapShape3D:
-    if not heightmap_atlas:
-        return null
-
-    var heightmap_image = heightmap_atlas.get_image()
-    if heightmap_image.is_empty():
-        return null
-
-    if not uv_offsets.has(tile_coords) or not uv_scales.has(tile_coords):
-        return null
-
-    # Get tile's region in the atlas
-    var uv_offset = uv_offsets[tile_coords]
-    var uv_scale = uv_scales[tile_coords]
-
-    var atlas_width = heightmap_image.get_width()
-    var atlas_height = heightmap_image.get_height()
-
-    # Calculate pixel coordinates in atlas
-    var start_x = int(uv_offset.x * atlas_width)
-    var start_y = int(uv_offset.y * atlas_height)
-    var region_width = int(uv_scale.x * atlas_width)
-    var region_height = int(uv_scale.y * atlas_height)
-
-    # Use the same resolution as our mesh (32x32 vertices = 31 subdivisions + 1)
-    var collision_resolution = 32
-    var height_data = PackedFloat32Array()
-    height_data.resize(collision_resolution * collision_resolution)
-
-    # Calculate sampling step
-    var step_x = float(region_width - 1) / (collision_resolution - 1)
-    var step_y = float(region_height - 1) / (collision_resolution - 1)
-
-    # For uniform scaling, we need to adjust the height values
-    # so that when scaled uniformly, they match the actual terrain height
-    var horizontal_scale_factor = tile_size / (collision_resolution - 1)
-
-    # Sample heights from atlas
-    for z in range(collision_resolution):
-        for x in range(collision_resolution):
-            var sample_x = start_x + int(x * step_x)
-            var sample_y = start_y + int(z * step_y)
-
-            # Clamp to image bounds
-            sample_x = clampi(sample_x, 0, atlas_width - 1)
-            sample_y = clampi(sample_y, 0, atlas_height - 1)
-
-            var color = heightmap_image.get_pixel(sample_x, sample_y)
-            var raw_height = HeightSampler.decode_height_from_color(color)
-
-            # Adjust height for uniform scaling:
-            # When we scale uniformly by horizontal_scale_factor,
-            # the height needs to be scaled by the same factor.
-            # So we divide by horizontal_scale_factor to compensate.
-            var adjusted_height = (raw_height - min_height) / horizontal_scale_factor
-
-            height_data[z * collision_resolution + x] = adjusted_height
-
-    # Create heightmap shape
-    var heightmap_shape = HeightMapShape3D.new()
-    heightmap_shape.map_width = collision_resolution
-    heightmap_shape.map_depth = collision_resolution
-    heightmap_shape.map_data = height_data
-
-    print("Created heightmap shape for tile ", tile_coords,
-          " with uniform scaling adjustment")
-
-    return heightmap_shape
 
 func _create_tile_mesh_with_atlas(tile_coords: Vector2i, tile_size: float, min_height: float) -> Mesh:
     var plane_mesh = PlaneMesh.new()

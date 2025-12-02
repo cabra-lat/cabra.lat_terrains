@@ -292,7 +292,7 @@ func _handle_download_failure(task: Dictionary, error: String) -> void:
 
 func _is_tile_in_queue(tile_coords: Vector2i, zoom: int, layer_type: String) -> bool:
   for task in download_queue:
-    if task.coords == tile_coords and task.zoom == zoom and task.layer_type == layer_type:
+    if task and task.coords == tile_coords and task.zoom == zoom and task.layer_type == layer_type:
       return true
   return false
 
