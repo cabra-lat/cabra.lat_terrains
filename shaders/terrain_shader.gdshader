@@ -1,31 +1,19 @@
 shader_type spatial;
 render_mode cull_disabled;
 
-uniform sampler2D heightmap_texture: hint_default_black, source_color, repeat_disable, filter_nearest;
-uniform sampler2D normalmap_texture: hint_normal;
-uniform sampler2D albedo_texture: source_color, filter_nearest;
-uniform float terrain_scale = 1000.0;
-uniform float height_scale = 1.0; // 1:1 height scale
-uniform bool use_precomputed_normals = true;
-uniform float min_height = -1000.0;
-uniform float max_height = 10000.0;
-// Topographic colors
-uniform vec3 deep_water_color: source_color = vec3(0.0, 0.1, 0.3);
-uniform vec3 shallow_water_color: source_color = vec3(0.0, 0.3, 0.6);
-uniform vec3 sand_color: source_color = vec3(0.76, 0.7, 0.5);
-uniform vec3 grass_low_color: source_color = vec3(0.2, 0.5, 0.2);
-uniform vec3 grass_high_color: source_color = vec3(0.3, 0.6, 0.3);
-uniform vec3 forest_color: source_color = vec3(0.1, 0.4, 0.1);
-uniform vec3 rock_color: source_color = vec3(0.5, 0.5, 0.5);
-uniform vec3 snow_color: source_color = vec3(1.0, 1.0, 1.0);
+// Atlases
+uniform sampler2D heightmap_atlas: hint_default_black, source_color, repeat_disable, filter_nearest;
+uniform sampler2D normalmap_atlas: hint_normal, repeat_disable, filter_linear_mipmap;
+uniform sampler2D albedo_atlas: source_color, repeat_disable, filter_linear_mipmap;
 
-// Height thresholds in meters (adjust based on your region)
-uniform float water_level = 70.0;
-uniform float sand_level = 120.0;
-uniform float grass_level = 200.0;
-uniform float forest_level = 500.0;
-uniform float rock_level = 1000.0;
-uniform float snow_level = 1500.0;
+// UV offset and scale for this tile in the atlas
+uniform vec2 uv_offset;
+uniform vec2 uv_scale;
+
+// Terrain parameters
+uniform float terrain_scale = 1000.0;
+uniform float height_scale = 1.0;
+uniform bool use_precomputed_normals = true;
 
 varying float v_height;
 
@@ -33,95 +21,76 @@ varying float v_height;
 float decode_height(vec4 color) {
     float r = floor(color.r * 255.0);
     float g = floor(color.g * 255.0);
-    float b = floor(color.b * 255.0); // floor is important here to avoid moiré patterns
-    float h = floor((r * 256.0 + g + b / 256.0) - 32768.0);
-    return clamp(h, min_height, max_height);
+    float b = floor(color.b * 255.0);
+    return (r * 256.0 + g + b / 256.0) - 32768.0;
 }
 
-// Calculate normal from heightmap with proper scale
-vec3 calculate_normal(vec2 uv, float delta) {
-    float height_center = decode_height(texture(heightmap_texture, uv));
-
-    vec2 texel_size = 1.0 / vec2(textureSize(heightmap_texture, 0));
-
-    float height_right = decode_height(texture(heightmap_texture, uv + vec2(texel_size.x, 0.0)));
-    float height_left  = decode_height(texture(heightmap_texture, uv + vec2(-texel_size.x, 0.0)));
-    float height_up    = decode_height(texture(heightmap_texture, uv + vec2(0.0, texel_size.y)));
-    float height_down  = decode_height(texture(heightmap_texture, uv + vec2(0.0, -texel_size.y)));
-
-    // Scale the normal calculation by the actual terrain scale
-    float horizontal_scale = terrain_scale; // Use the actual terrain size
-    vec3 normal = normalize(vec3(
-        (height_left - height_right) * horizontal_scale,
-        delta * 2.0, // This controls the normal strength
-        (height_down - height_up) * horizontal_scale
-    ));
-
-    return normal;
+// Transform local UV to atlas UV
+vec2 transform_uv(vec2 local_uv) {
+    return uv_offset + local_uv * uv_scale;
 }
-
-const float EPS = 0.01;
 
 void vertex() {
-    vec2 uv = clamp(UV, 0.0 + EPS, 1.0 - EPS);
-    // Sample height from texture (in meters)
-    vec4 height_color = texture(heightmap_texture, uv);
+    vec2 local_uv = UV;
+    vec2 atlas_uv = transform_uv(local_uv);
+    
+    // Sample height from atlas
+    vec4 height_color = texture(heightmap_atlas, atlas_uv);
     float raw_height = decode_height(height_color);
-
-    // Apply 1:1 height scaling (1 meter in data = 1 meter in world)
     float height = raw_height * height_scale;
     v_height = raw_height;
-
-    // Displace vertex - this is now in real meters
+    
+    // Displace vertex
     VERTEX.y = height;
-
-    // Calculate normal
-    NORMAL = calculate_normal(uv, terrain_scale * 0.01); // Adjust normal strength based on terrain scale
+    
+    // Calculate normal from heightmap atlas (fallback if precomputed normals are disabled)
+    if (!use_precomputed_normals) {
+        float delta = 0.001;
+        
+        // Sample neighboring heights in atlas space
+        float h_center = decode_height(texture(heightmap_atlas, atlas_uv));
+        float h_right = decode_height(texture(heightmap_atlas, atlas_uv + vec2(delta * uv_scale.x, 0.0)));
+        float h_up = decode_height(texture(heightmap_atlas, atlas_uv + vec2(0.0, delta * uv_scale.y)));
+        
+        // Calculate gradient
+        vec3 normal = normalize(vec3(
+            (h_center - h_right) * terrain_scale,
+            delta * terrain_scale * 100.0,  // Scale factor for normal strength
+            (h_center - h_up) * terrain_scale
+        ));
+        
+        NORMAL = normal;
+    }
 }
 
 void fragment() {
-    float height = v_height;
-    vec3 color = deep_water_color;
-
-    // Apply topographic coloring based on height
-    if (height < water_level) {
-        float t = height / water_level;
-        color = mix(deep_water_color, shallow_water_color, t);
-    } else if (height < sand_level) {
-        color = sand_color;
-    } else if (height < grass_level) {
-        float t = (height - sand_level) / (grass_level - sand_level);
-        color = mix(sand_color, grass_low_color, t);
-    } else if (height < forest_level) {
-        float t = (height - grass_level) / (forest_level - grass_level);
-        color = mix(grass_high_color, forest_color, t);
-    } else if (height < rock_level) {
-        float t = (height - forest_level) / (rock_level - forest_level);
-        color = mix(forest_color, rock_color, t);
-    } else if (height < snow_level) {
-        float t = (height - rock_level) / (snow_level - rock_level);
-        color = mix(rock_color, snow_color, t);
-    } else {
-        color = snow_color;
-    }
-
+    vec2 local_uv = UV;
+    vec2 atlas_uv = transform_uv(local_uv);
+    
+    // Sample albedo from atlas
+    vec4 albedo_color = texture(albedo_atlas, atlas_uv);
+    ALBEDO = albedo_color.rgb;
+    
     // Use precomputed normal map if available
     if (use_precomputed_normals) {
-        vec3 normal_map = texture(normalmap_texture, UV).rgb;
-        // Convert from [0,1] to [-1,1] range and apply
-        NORMAL = normalize(normal_map * 2.0 - 1.0);
+        vec4 normal_color = texture(normalmap_atlas, atlas_uv);
+        vec3 normal_map = normal_color.rgb * 2.0 - 1.0;
+        NORMAL = normalize(normal_map);
     }
-    vec2 uv = UV;
-    vec2 texel_size = 1.0 / vec2(textureSize(heightmap_texture, 0));
-    uv -= 0.5 * texel_size;
-    uv = clamp(uv, 0.0 + EPS, 1.0 - EPS);
-    ALBEDO = texture(albedo_texture, uv).rgb;
+    
+    // Material properties
     METALLIC = 0.0;
     ROUGHNESS = 0.8;
-
+    
     // Add some specular for water areas
-    if (height < water_level) {
+    if (v_height < 70.0) {
         METALLIC = 0.1;
         ROUGHNESS = 0.3;
+        // Tint water areas blue
+        ALBEDO = mix(ALBEDO, vec3(0.0, 0.2, 0.8), 0.3);
     }
+    
+    // Optional: Add height-based fog
+    float fog_factor = clamp(v_height / 1000.0, 0.0, 0.3);
+    ALBEDO = mix(ALBEDO, vec3(0.8, 0.8, 0.9), fog_factor);
 }
